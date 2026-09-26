@@ -1,0 +1,1596 @@
+// CUDA kernels for the seeker CUDA backend.
+//
+// Compiled at runtime through NVRTC (see src/backend/cuda.rs) and test-built
+// with nvcc for sm_86. Contains no host code and no system includes: only
+// built-in types are used, so the source compiles under NVRTC without headers.
+//
+// The secp256k1 public-key derivation (field arithmetic, Jacobian point ops,
+// the w=8 fixed-window generator multiply and the precomputed [0..255]*G
+// constant-memory table) is vendored from UltrafastSecp256k1
+// (https://github.com/shrec/UltrafastSecp256k1), MIT License,
+// (c) 2026 Vano Chkheidze, adapted as noted:
+//  - the 32 windows of the scalar are read directly from the big-endian
+//    secret bytes in global memory, so no local scalar array is needed and
+//    everything stays in registers;
+//  - the compressed-key serialization normalizes both coordinates before the
+//    parity check;
+//  - window loop adapted from scalar_mul_generator_w8 (the dummy-start
+//    "ct" variant in upstream corrects with a single -G subtraction, which
+//    does not balance the 2^256*G contribution of the 256 doublings and
+//    produces (k + 2^256 - n - 1)*G instead of k*G; the plain w8 windows
+//    here are the textbook MSB-first fixed-window scheme).
+//
+// The SHA-256 / RIPEMD-160 / fused HASH160 kernels at the bottom are the
+// original seeker implementations, unchanged.
+//
+// The vendored portions of this file incorporate work provided under the
+// MIT License, Copyright (c) 2026 Vano Chkheidze
+// (https://github.com/shrec/UltrafastSecp256k1). Permission is hereby
+// granted, free of charge, to any person obtaining a copy of this software
+// and associated documentation files (the "Software"), to deal in the
+// Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions: The above
+// copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software. THE SOFTWARE IS PROVIDED
+// "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. IN NO EVENT
+// SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
+// OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+// OTHER DEALINGS IN THE SOFTWARE.
+
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long long u64;
+
+// 256-bit field element mod p = 2^256 - 2^32 - 977, 4x64-bit little-endian limbs.
+struct FieldElement { u64 limbs[4]; };
+// Affine point (x, y).
+struct AffinePoint { FieldElement x; FieldElement y; };
+// Jacobian point (X:Y:Z), affine (x, y) = (X/Z^2, Y/Z^3).
+struct JacobianPoint { FieldElement x; FieldElement y; FieldElement z; bool infinity; };
+
+static_assert(sizeof(FieldElement) == 32, "field element must be 256 bits");
+// ---- vendored from UltrafastSecp256k1 (MIT, (c) 2026 Vano Chkheidze) ----
+__constant__ static const u64 MODULUS[4] = {
+    0xFFFFFFFEFFFFFC2FULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL
+};
+__constant__ static const u64 K_MOD = 0x1000003D1ULL;
+    // P = 2^256 - K_MOD, where K_MOD = 2^32 + 977 = 0x1000003D1
+__constant__ static const u64 GENERATOR_X[4] = {
+    0x59F2815B16F81798ULL,
+    0x029BFCDB2DCE28D9ULL,
+    0x55A06295CE870B07ULL,
+    0x79BE667EF9DCBBACULL
+};
+__constant__ static const u64 GENERATOR_Y[4] = {
+    0x9C47D08FFB10D4B8ULL,
+    0xFD17B448A6855419ULL,
+    0x5DA4FBFC0E1108A8ULL,
+    0x483ADA7726A3C465ULL
+};
+// ---- PTX comba 256x256->512 multiply / squaring ----
+// Uses PTX mad.lo.cc / madc.hi.cc for optimal instruction chaining.
+#define PTX_MAD_ACC(c0, c1, c2, a, b) \
+    asm volatile( \
+        "mad.lo.cc.u64 %0, %3, %4, %0; \n\t" \
+        "madc.hi.cc.u64 %1, %3, %4, %1; \n\t" \
+        "addc.u64 %2, %2, 0; \n\t" \
+        : "+l"(c0), "+l"(c1), "+l"(c2) \
+        : "l"(a), "l"(b) \
+    );
+__device__ __forceinline__ void mul_256_512_ptx(const u64* a, const u64* b, u64* r) {
+    u64 a0 = a[0];
+    u64 a1 = a[1];
+    u64 a2 = a[2];
+    u64 a3 = a[3];
+
+    u64 b0 = b[0];
+    u64 b1 = b[1];
+    u64 b2 = b[2];
+    u64 b3 = b[3];
+
+    u64 c0 = 0, c1 = 0, c2 = 0;
+
+    // Col 0
+    PTX_MAD_ACC(c0, c1, c2, a0, b0);
+    r[0] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 1
+    PTX_MAD_ACC(c0, c1, c2, a0, b1);
+    PTX_MAD_ACC(c0, c1, c2, a1, b0);
+    r[1] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 2
+    PTX_MAD_ACC(c0, c1, c2, a0, b2);
+    PTX_MAD_ACC(c0, c1, c2, a1, b1);
+    PTX_MAD_ACC(c0, c1, c2, a2, b0);
+    r[2] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 3
+    PTX_MAD_ACC(c0, c1, c2, a0, b3);
+    PTX_MAD_ACC(c0, c1, c2, a1, b2);
+    PTX_MAD_ACC(c0, c1, c2, a2, b1);
+    PTX_MAD_ACC(c0, c1, c2, a3, b0);
+    r[3] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 4
+    PTX_MAD_ACC(c0, c1, c2, a1, b3);
+    PTX_MAD_ACC(c0, c1, c2, a2, b2);
+    PTX_MAD_ACC(c0, c1, c2, a3, b1);
+    r[4] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 5
+    PTX_MAD_ACC(c0, c1, c2, a2, b3);
+    PTX_MAD_ACC(c0, c1, c2, a3, b2);
+    r[5] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 6
+    PTX_MAD_ACC(c0, c1, c2, a3, b3);
+    r[6] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 7
+    r[7] = c0;
+}
+__device__ __forceinline__ void sqr_256_512_ptx(const u64* a, u64* r) {
+    u64 a0 = a[0];
+    u64 a1 = a[1];
+    u64 a2 = a[2];
+    u64 a3 = a[3];
+
+    u64 c0 = 0, c1 = 0, c2 = 0;
+
+    // Col 0: a0*a0
+    PTX_MAD_ACC(c0, c1, c2, a0, a0);
+    r[0] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 1: 2 * a0*a1
+    PTX_MAD_ACC(c0, c1, c2, a0, a1);
+    PTX_MAD_ACC(c0, c1, c2, a0, a1);
+    r[1] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 2: 2 * a0*a2 + a1*a1
+    PTX_MAD_ACC(c0, c1, c2, a0, a2);
+    PTX_MAD_ACC(c0, c1, c2, a0, a2);
+    PTX_MAD_ACC(c0, c1, c2, a1, a1);
+    r[2] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 3: 2 * (a0*a3 + a1*a2)
+    PTX_MAD_ACC(c0, c1, c2, a0, a3);
+    PTX_MAD_ACC(c0, c1, c2, a0, a3);
+    PTX_MAD_ACC(c0, c1, c2, a1, a2);
+    PTX_MAD_ACC(c0, c1, c2, a1, a2);
+    r[3] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 4: 2 * a1*a3 + a2*a2
+    PTX_MAD_ACC(c0, c1, c2, a1, a3);
+    PTX_MAD_ACC(c0, c1, c2, a1, a3);
+    PTX_MAD_ACC(c0, c1, c2, a2, a2);
+    r[4] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 5: 2 * a2*a3
+    PTX_MAD_ACC(c0, c1, c2, a2, a3);
+    PTX_MAD_ACC(c0, c1, c2, a2, a3);
+    r[5] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 6: a3*a3
+    PTX_MAD_ACC(c0, c1, c2, a3, a3);
+    r[6] = c0;
+    c0 = c1; c1 = c2; c2 = 0;
+
+    // Col 7
+    r[7] = c0;
+}
+// ---- fast reduction mod p (PTX) ----
+__device__ __forceinline__ void reduce_512_to_256(u64 t[8], FieldElement* r) {
+    // P = 2^256 - K_MOD, where K_MOD = 2^32 + 977 = 0x1000003D1
+    // T = T_hi * 2^256 + T_lo == T_hi * K_MOD + T_lo (mod P)
+    //
+    // OPTIMIZATION: Multiply T_hi by K_MOD directly in one MAD chain,
+    // instead of splitting into T_hi*977 + T_hi<<32 (two separate passes).
+    // Saves ~26 instructions and 7 registers per call.
+    
+    u64 t0 = t[0], t1 = t[1], t2 = t[2], t3 = t[3];
+    u64 t4 = t[4], t5 = t[5], t6 = t[6], t7 = t[7];
+    
+    // 1. Compute A = T_hi * K_MOD (5 limbs: a0..a4)
+    //    Single MAD chain -- replaces separate *977 + <<32 two-pass approach
+    u64 a0, a1, a2, a3, a4;
+    
+    asm volatile(
+        "mul.lo.u64 %0, %5, %9; \n\t"
+        "mul.hi.u64 %1, %5, %9; \n\t"
+        
+        "mad.lo.cc.u64 %1, %6, %9, %1; \n\t"
+        "madc.hi.u64 %2, %6, %9, 0; \n\t"
+        
+        "mad.lo.cc.u64 %2, %7, %9, %2; \n\t"
+        "madc.hi.u64 %3, %7, %9, 0; \n\t"
+        
+        "mad.lo.cc.u64 %3, %8, %9, %3; \n\t"
+        "madc.hi.u64 %4, %8, %9, 0; \n\t"
+        
+        : "=l"(a0), "=l"(a1), "=l"(a2), "=l"(a3), "=l"(a4)
+        : "l"(t4), "l"(t5), "l"(t6), "l"(t7), "l"(K_MOD)
+    );
+    
+    // 2. Add A[0..3] to T_lo
+    u64 carry;
+    asm volatile(
+        "add.cc.u64 %0, %0, %5; \n\t"
+        "addc.cc.u64 %1, %1, %6; \n\t"
+        "addc.cc.u64 %2, %2, %7; \n\t"
+        "addc.cc.u64 %3, %3, %8; \n\t"
+        "addc.u64 %4, 0, 0; \n\t"
+        : "+l"(t0), "+l"(t1), "+l"(t2), "+l"(t3), "=l"(carry)
+        : "l"(a0), "l"(a1), "l"(a2), "l"(a3)
+    );
+    
+    // 3. Reduce overflow: extra = a4 + carry (<= 2^33 + 1)
+    //    extra * K_MOD fits in 2 limbs (<= 2^66)
+    u64 extra = a4 + carry;
+    u64 ek_lo, ek_hi;
+    asm volatile(
+        "mul.lo.u64 %0, %2, %3; \n\t"
+        "mul.hi.u64 %1, %2, %3; \n\t"
+        : "=l"(ek_lo), "=l"(ek_hi)
+        : "l"(extra), "l"(K_MOD)
+    );
+    
+    u64 c;
+    asm volatile(
+        "add.cc.u64 %0, %0, %5; \n\t"
+        "addc.cc.u64 %1, %1, %6; \n\t"
+        "addc.cc.u64 %2, %2, 0; \n\t"
+        "addc.cc.u64 %3, %3, 0; \n\t"
+        "addc.u64 %4, 0, 0; \n\t"
+        : "+l"(t0), "+l"(t1), "+l"(t2), "+l"(t3), "=l"(c)
+        : "l"(ek_lo), "l"(ek_hi)
+    );
+    
+    // 4. Rare carry overflow (probability ~= 2^{-190})
+    if (c) {
+        asm volatile(
+            "add.cc.u64 %0, %0, %4; \n\t"
+            "addc.cc.u64 %1, %1, 0; \n\t"
+            "addc.cc.u64 %2, %2, 0; \n\t"
+            "addc.u64 %3, %3, 0; \n\t"
+            : "+l"(t0), "+l"(t1), "+l"(t2), "+l"(t3)
+            : "l"(K_MOD)
+        );
+    }
+    
+    // 5. Conditional subtraction of P
+    u64 r0, r1, r2, r3, borrow;
+    asm volatile(
+        "sub.cc.u64 %0, %5, %9; \n\t"
+        "subc.cc.u64 %1, %6, %10; \n\t"
+        "subc.cc.u64 %2, %7, %11; \n\t"
+        "subc.cc.u64 %3, %8, %12; \n\t"
+        "subc.u64 %4, 0, 0; \n\t"
+        : "=l"(r0), "=l"(r1), "=l"(r2), "=l"(r3), "=l"(borrow)
+        : "l"(t0), "l"(t1), "l"(t2), "l"(t3),
+          "l"(MODULUS[0]), "l"(MODULUS[1]), "l"(MODULUS[2]), "l"(MODULUS[3])
+    );
+    
+    // CT: branchless final reduction (cmov) — borrow==0 means value >= MODULUS, so select
+    // the subtracted limbs r0..r3; else keep the originals t0..t3. No data-dependent branch.
+    {
+        u64 need = (u64)(borrow == 0ULL);
+        asm volatile("" : "+l"(need));
+        const u64 msk = (u64)0 - need;
+        r->limbs[0] = (r0 & msk) | (t0 & ~msk);
+        r->limbs[1] = (r1 & msk) | (t1 & ~msk);
+        r->limbs[2] = (r2 & msk) | (t2 & ~msk);
+        r->limbs[3] = (r3 & msk) | (t3 & ~msk);
+    }
+}
+// ---- field ops (PTX variants) ----
+
+// ---- thin wrappers completing the vendored field set ----
+__device__ __forceinline__ void field_set_zero(FieldElement* r) {
+    r->limbs[0] = 0; r->limbs[1] = 0; r->limbs[2] = 0; r->limbs[3] = 0;
+}
+__device__ __forceinline__ void field_set_one(FieldElement* r) {
+    r->limbs[0] = 1; r->limbs[1] = 0; r->limbs[2] = 0; r->limbs[3] = 0;
+}
+__device__ __forceinline__ bool field_is_zero(const FieldElement* a) {
+    return (a->limbs[0] | a->limbs[1] | a->limbs[2] | a->limbs[3]) == 0;
+}
+__device__ __forceinline__ void field_mul(const FieldElement* a, const FieldElement* b, FieldElement* r) {
+    u64 t[8];
+    mul_256_512_ptx(a->limbs, b->limbs, t);
+    reduce_512_to_256(t, r);
+}
+__device__ __forceinline__ void field_sqr(const FieldElement* a, FieldElement* r) {
+    u64 t[8];
+    sqr_256_512_ptx(a->limbs, t);
+    reduce_512_to_256(t, r);
+}
+__device__ __forceinline__ void field_add(const FieldElement* a, const FieldElement* b, FieldElement* r) {
+    u64 r0, r1, r2, r3, carry;
+    
+    asm volatile(
+        "add.cc.u64 %0, %5, %9; \n\t"
+        "addc.cc.u64 %1, %6, %10; \n\t"
+        "addc.cc.u64 %2, %7, %11; \n\t"
+        "addc.cc.u64 %3, %8, %12; \n\t"
+        "addc.u64 %4, 0, 0; \n\t"
+        : "=l"(r0), "=l"(r1), "=l"(r2), "=l"(r3), "=l"(carry)
+        : "l"(a->limbs[0]), "l"(a->limbs[1]), "l"(a->limbs[2]), "l"(a->limbs[3]),
+          "l"(b->limbs[0]), "l"(b->limbs[1]), "l"(b->limbs[2]), "l"(b->limbs[3])
+    );
+    
+    u64 t0, t1, t2, t3, borrow;
+    asm volatile(
+        "sub.cc.u64 %0, %5, %9; \n\t"
+        "subc.cc.u64 %1, %6, %10; \n\t"
+        "subc.cc.u64 %2, %7, %11; \n\t"
+        "subc.cc.u64 %3, %8, %12; \n\t"
+        "subc.u64 %4, 0, 0; \n\t"
+        : "=l"(t0), "=l"(t1), "=l"(t2), "=l"(t3), "=l"(borrow)
+        : "l"(r0), "l"(r1), "l"(r2), "l"(r3),
+          "l"(MODULUS[0]), "l"(MODULUS[1]), "l"(MODULUS[2]), "l"(MODULUS[3])
+    );
+    
+    // CT: branchless conditional subtraction of MODULUS (cmov, not a data-dependent branch).
+    {
+        u64 need = (u64)((carry != 0ULL) | (borrow == 0ULL));
+        asm volatile("" : "+l"(need));
+        const u64 msk = (u64)0 - need;
+        r->limbs[0] = (t0 & msk) | (r0 & ~msk);
+        r->limbs[1] = (t1 & msk) | (r1 & ~msk);
+        r->limbs[2] = (t2 & msk) | (r2 & ~msk);
+        r->limbs[3] = (t3 & msk) | (r3 & ~msk);
+    }
+}
+__device__ __forceinline__ void field_sub(const FieldElement* a, const FieldElement* b, FieldElement* r) {
+    u64 r0, r1, r2, r3, borrow;
+    
+    asm volatile(
+        "sub.cc.u64 %0, %5, %9; \n\t"
+        "subc.cc.u64 %1, %6, %10; \n\t"
+        "subc.cc.u64 %2, %7, %11; \n\t"
+        "subc.cc.u64 %3, %8, %12; \n\t"
+        "subc.u64 %4, 0, 0; \n\t"
+        : "=l"(r0), "=l"(r1), "=l"(r2), "=l"(r3), "=l"(borrow)
+        : "l"(a->limbs[0]), "l"(a->limbs[1]), "l"(a->limbs[2]), "l"(a->limbs[3]),
+          "l"(b->limbs[0]), "l"(b->limbs[1]), "l"(b->limbs[2]), "l"(b->limbs[3])
+    );
+    
+    // CT: branchless add-back of MODULUS on underflow (always compute, cmov-select).
+    {
+        u64 a0, a1, a2, a3;
+        asm volatile(
+            "add.cc.u64 %0, %4, %8; \n\t"
+            "addc.cc.u64 %1, %5, %9; \n\t"
+            "addc.cc.u64 %2, %6, %10; \n\t"
+            "addc.u64 %3, %7, %11; \n\t"
+            : "=l"(a0), "=l"(a1), "=l"(a2), "=l"(a3)
+            : "l"(r0), "l"(r1), "l"(r2), "l"(r3),
+              "l"(MODULUS[0]), "l"(MODULUS[1]), "l"(MODULUS[2]), "l"(MODULUS[3])
+        );
+        u64 need = (u64)(borrow != 0ULL);
+        asm volatile("" : "+l"(need));
+        const u64 msk = (u64)0 - need;
+        r->limbs[0] = (a0 & msk) | (r0 & ~msk);
+        r->limbs[1] = (a1 & msk) | (r1 & ~msk);
+        r->limbs[2] = (a2 & msk) | (r2 & ~msk);
+        r->limbs[3] = (a3 & msk) | (r3 & ~msk);
+    }
+}
+__device__ __forceinline__ void field_sqr_n(FieldElement* a, int n) {
+    #pragma unroll 1
+    for (int i = 0; i < n; ++i) {
+        field_sqr(a, a);
+    }
+}
+__device__ inline void field_inv_fermat_chain_impl(const FieldElement* a, FieldElement* r) {
+    FieldElement x_0, x_1, x_2, x_3, x_4, x_5;
+    FieldElement t;
+
+    // Build x2 = x^3 (2 ones) -> x_0
+    field_sqr(a, &x_0);
+    field_mul(&x_0, a, &x_0);
+
+    // Build x3 = x^7 (3 ones) -> x_1
+    field_sqr(&x_0, &x_1);
+    field_mul(&x_1, a, &x_1);
+
+    // Build x6 = x^63 (6 ones) -> x_2
+    field_sqr(&x_1, &x_2);
+    field_sqr(&x_2, &x_2);
+    field_sqr(&x_2, &x_2);
+    field_mul(&x_2, &x_1, &x_2);
+
+    // Build x9 = x^511 (9 ones) -> x_3
+    field_sqr(&x_2, &x_3);
+    field_sqr(&x_3, &x_3);
+    field_sqr(&x_3, &x_3);
+    field_mul(&x_3, &x_1, &x_3);
+
+    // Build x11 = x^2047 (11 ones) -> x_4
+    field_sqr(&x_3, &x_4);
+    field_sqr(&x_4, &x_4);
+    field_mul(&x_4, &x_0, &x_4);
+
+    // Build x22 = x^(2^22-1) (22 ones) -> x_3 (reuse)
+    t = x_4;
+    field_sqr_n(&t, 11);
+    field_mul(&t, &x_4, &x_3);
+
+    // Build x44 = x^(2^44-1) (44 ones) -> x_4 (reuse)
+    t = x_3;
+    field_sqr_n(&t, 22);
+    field_mul(&t, &x_3, &x_4);
+
+    // Build x88 = x^(2^88-1) (88 ones) -> x_5
+    t = x_4;
+    field_sqr_n(&t, 44);
+    field_mul(&t, &x_4, &x_5);
+
+    // Build x176 = x^(2^176-1) (176 ones) -> x_5 (reuse)
+    t = x_5;
+    field_sqr_n(&t, 88);
+    field_mul(&t, &x_5, &x_5);
+
+    // Build x220 = x^(2^220-1) (220 ones) -> x_5 (reuse)
+    field_sqr_n(&x_5, 44);
+    field_mul(&x_5, &x_4, &x_5);
+
+    // Build x223 = x^(2^223-1) (223 ones) -> x_5 (reuse)
+    field_sqr(&x_5, &x_5);
+    field_sqr(&x_5, &x_5);
+    field_sqr(&x_5, &x_5);
+    field_mul(&x_5, &x_1, &x_5);
+
+    // Assemble p-2: shift by 1 (add 0 bit)
+    field_sqr(&x_5, &t);
+
+    // Append 22 ones
+    field_sqr_n(&t, 22);
+    field_mul(&t, &x_3, &t);
+
+    // Shift by 4 (add 0000)
+    field_sqr(&t, &t);
+    field_sqr(&t, &t);
+    field_sqr(&t, &t);
+    field_sqr(&t, &t);
+
+    // Append 101101 (6 bits)
+    field_sqr(&t, &t); field_mul(&t, a, &t);  // 1
+    field_sqr(&t, &t);                          // 0
+    field_sqr(&t, &t); field_mul(&t, a, &t);  // 1
+    field_sqr(&t, &t); field_mul(&t, a, &t);  // 1
+    field_sqr(&t, &t);                          // 0
+    field_sqr(&t, &t); field_mul(&t, a, r);   // 1
+}
+__device__ inline void field_inv(const FieldElement* a, FieldElement* r) {
+    if (field_is_zero(a)) {
+        r->limbs[0] = 0; r->limbs[1] = 0; r->limbs[2] = 0; r->limbs[3] = 0;
+        return;
+    }
+
+    // Works for both Montgomery and Standard domains
+    // Montgomery: (aR)^(p-2) = (aR)^-1
+    // Standard: a^(p-2) = a^-1
+    // The "wrong" inversion actually works because of how affine conversion uses it!
+    field_inv_fermat_chain_impl(a, r);
+}
+// ---- unchecked Jacobian point ops ----
+__device__ inline void jacobian_double_unchecked(const JacobianPoint* p, JacobianPoint* r) {
+    FieldElement S, M, X3, Y3, Z3, YY, YYYY, t1;
+
+    field_sqr(&p->y, &YY);
+
+    field_mul(&p->x, &YY, &S);
+    field_add(&S, &S, &S);
+    field_add(&S, &S, &S);
+
+    field_sqr(&p->x, &M);
+    field_add(&M, &M, &t1);
+    field_add(&M, &t1, &M);
+
+    field_sqr(&M, &X3);
+    field_add(&S, &S, &t1);
+    field_sub(&X3, &t1, &X3);
+
+    field_sqr(&YY, &YYYY);
+
+    field_add(&YYYY, &YYYY, &t1);
+    field_add(&t1, &t1, &t1);
+    field_add(&t1, &t1, &t1);
+    field_sub(&S, &X3, &S);
+    field_mul(&M, &S, &Y3);
+    field_sub(&Y3, &t1, &Y3);
+
+    field_mul(&p->y, &p->z, &Z3);
+    field_add(&Z3, &Z3, &Z3);
+
+    r->x = X3;
+    r->y = Y3;
+    r->z = Z3;
+    r->infinity = false;
+}
+__device__ inline void jacobian_add_mixed_unchecked(const JacobianPoint* p, const AffinePoint* q, JacobianPoint* r) {
+    FieldElement z1z1, u2, s2, h, hh, i, j, rr, v;
+    FieldElement X3, Y3, Z3, t1, t2;
+
+    field_sqr(&p->z, &z1z1);
+    field_mul(&q->x, &z1z1, &u2);
+
+    field_mul(&p->z, &z1z1, &t1);
+    field_mul(&q->y, &t1, &s2);
+
+    field_sub(&u2, &p->x, &h);
+
+    if (field_is_zero(&h)) {
+        field_sub(&s2, &p->y, &t1);
+        if (field_is_zero(&t1)) {
+            jacobian_double_unchecked(p, r);
+            return;
+        }
+        r->infinity = true;
+        return;
+    }
+
+    field_sqr(&h, &hh);
+    field_add(&hh, &hh, &i);
+    field_add(&i, &i, &i);
+    field_mul(&h, &i, &j);
+
+    field_sub(&s2, &p->y, &t1);
+    field_add(&t1, &t1, &rr);
+
+    field_mul(&p->x, &i, &v);
+
+    field_sqr(&rr, &X3);
+    field_sub(&X3, &j, &X3);
+    field_add(&v, &v, &t1);
+    field_sub(&X3, &t1, &X3);
+
+    field_sub(&v, &X3, &t1);
+    field_mul(&rr, &t1, &Y3);
+    field_mul(&p->y, &j, &t2);
+    field_add(&t2, &t2, &t2);
+    field_sub(&Y3, &t2, &Y3);
+
+    field_add(&p->z, &h, &t1);
+    field_sqr(&t1, &Z3);
+    field_sub(&Z3, &z1z1, &Z3);
+    field_sub(&Z3, &hh, &Z3);
+
+    r->x = X3;
+    r->y = Y3;
+    r->z = Z3;
+    r->infinity = false;  // must be explicit: unchecked variant doesn't guarantee this
+}
+// ---- precomputed [0..255]*G table in __constant__ memory ----
+// ---- precomputed [0..255]*G table in __constant__ memory ----
+__device__ __constant__ static const AffinePoint GENERATOR_TABLE_W8[256] = {
+    // [0] = O (identity)
+    {{{0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL}}, {{0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL}}},
+    // [1] = 1G
+    {{{0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL}}, {{0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL}}},
+    // [2] = 2G
+    {{{0xABAC09B95C709EE5ULL, 0x5C778E4B8CEF3CA7ULL, 0x3045406E95C07CD8ULL, 0xC6047F9441ED7D6DULL}}, {{0x236431A950CFE52AULL, 0xF7F632653266D0E1ULL, 0xA3C58419466CEAEEULL, 0x1AE168FEA63DC339ULL}}},
+    // [3] = 3G
+    {{{0x8601F113BCE036F9ULL, 0xB531C845836F99B0ULL, 0x49344F85F89D5229ULL, 0xF9308A019258C310ULL}}, {{0x6CB9FD7584B8E672ULL, 0x6500A99934C2231BULL, 0x0FE337E62A37F356ULL, 0x388F7B0F632DE814ULL}}},
+    // [4] = 4G
+    {{{0x74FA94ABE8C4CD13ULL, 0xCC6C13900EE07584ULL, 0x581E4904930B1404ULL, 0xE493DBF1C10D80F3ULL}}, {{0xCFE97BDC47739922ULL, 0xD967AE33BFBDFE40ULL, 0x5642E2098EA51448ULL, 0x51ED993EA0D455B7ULL}}},
+    // [5] = 5G
+    {{{0xCBA8D569B240EFE4ULL, 0xE88B84BDDC619AB7ULL, 0x55B4A7250A5C5128ULL, 0x2F8BDE4D1A072093ULL}}, {{0xDCA87D3AA6AC62D6ULL, 0xF788271BAB0D6840ULL, 0xD4DBA9DDA6C9C426ULL, 0xD8AC222636E5E3D6ULL}}},
+    // [6] = 6G
+    {{{0x2F057A1460297556ULL, 0x82F6472F8568A18BULL, 0x20453A14355235D3ULL, 0xFFF97BD5755EEEA4ULL}}, {{0x3C870C36B075F297ULL, 0xDE80F0F6518FE4A0ULL, 0xF3BE96017F45C560ULL, 0xAE12777AACFBB620ULL}}},
+    // [7] = 7G
+    {{{0xE92BDDEDCAC4F9BCULL, 0x3D419B7E0330E39CULL, 0xA398F365F2EA7A0EULL, 0x5CBDF0646E5DB4EAULL}}, {{0xA5082628087264DAULL, 0xA813D0B813FDE7B5ULL, 0xA3178D6D861A54DBULL, 0x6AEBCA40BA255960ULL}}},
+    // [8] = 8G
+    {{{0x67784EF3E10A2A01ULL, 0x0A1BDD05E5AF888AULL, 0xAFF3843FB70F3C2FULL, 0x2F01E5E15CCA351DULL}}, {{0xB5DA2CB76CBDE904ULL, 0xC2E213D6BA5B7617ULL, 0x293D082A132D13B4ULL, 0x5C4DA8A741539949ULL}}},
+    // [9] = 9G
+    {{{0xC35F110DFC27CCBEULL, 0xE09796974C57E714ULL, 0x09AD178A9F559ABDULL, 0xACD484E2F0C7F653ULL}}, {{0x05CC262AC64F9C37ULL, 0xADD888A4375F8E0FULL, 0x64380971763B61E9ULL, 0xCC338921B0A7D9FDULL}}},
+    // [10] = 10G
+    {{{0x52A68E2A47E247C7ULL, 0x3442D49B1943C2B7ULL, 0x35477C7B1AE6AE5DULL, 0xA0434D9E47F3C862ULL}}, {{0x3CBEE53B037368D7ULL, 0x6F794C2ED877A159ULL, 0xA3B6C7E693A24C69ULL, 0x893ABA425419BC27ULL}}},
+    // [11] = 11G
+    {{{0xBBEC17895DA008CBULL, 0x5649980BE5C17891ULL, 0x5EF4246B70C65AACULL, 0x774AE7F858A9411EULL}}, {{0x301D74C9C953C61BULL, 0x372DB1E2DFF9D6A8ULL, 0x0243DD56D7B7B365ULL, 0xD984A032EB6B5E19ULL}}},
+    // [12] = 12G
+    {{{0xC5B0F47070AFE85AULL, 0x687CF4419620095BULL, 0x15C38F004D734633ULL, 0xD01115D548E7561BULL}}, {{0x6B051B13F4062327ULL, 0x79238C5DD9A86D52ULL, 0xA8B64537E17BD815ULL, 0xA9F34FFDC815E0D7ULL}}},
+    // [13] = 13G
+    {{{0xDEEDDF8F19405AA8ULL, 0xB075FBC6610E58CDULL, 0xC7D1D205C3748651ULL, 0xF28773C2D975288BULL}}, {{0x29B5CB52DB03ED81ULL, 0x3A1A06DA521FA91FULL, 0x758212EB65CDAF47ULL, 0x0AB0902E8D880A89ULL}}},
+    // [14] = 14G
+    {{{0xE49B241A60E823E4ULL, 0x26AA7B63678949E6ULL, 0xFD64E67F07D38E32ULL, 0x499FDF9E895E719CULL}}, {{0xC65F40D403A13F5BULL, 0x464279C27A3F95BCULL, 0x90F044E4A7B3D464ULL, 0xCAC2F6C4B54E8551ULL}}},
+    // [15] = 15G
+    {{{0x44ADBCF8E27E080EULL, 0x31E5946F3C85F79EULL, 0x5A465AE3095FF411ULL, 0xD7924D4F7D43EA96ULL}}, {{0xC504DC9FF6A26B58ULL, 0xEA40AF2BD896D3A5ULL, 0x83842EC228CC6DEFULL, 0x581E2872A86C72A6ULL}}},
+    // [16] = 16G
+    {{{0xC44EE89E2A6DEC0AULL, 0xB2A31369B87A5AE9ULL, 0x3011AABC21C23E97ULL, 0xE60FCE93B59E9EC5ULL}}, {{0xE1F32CCE69616821ULL, 0x1296891E44D23F0BULL, 0x9DB99F34F5793710ULL, 0xF7E3507399E59592ULL}}},
+    // [17] = 17G
+    {{{0x66E4FAA04A2D4A34ULL, 0xEB9898AE79B97687ULL, 0xA420FEE807EACF21ULL, 0xDEFDEA4CDB677750ULL}}, {{0xCFB199F69E56EB77ULL, 0xCED1F4A04A95C0F6ULL, 0xE997B0EAD2A93DAEULL, 0x4211AB0694635168ULL}}},
+    // [18] = 18G
+    {{{0xCF55C2A2444DA7CCULL, 0xF3BA28D1A319F5E7ULL, 0x2B0286DB4A990FA0ULL, 0x5601570CB47F238DULL}}, {{0xF5192E5E8B061D58ULL, 0x81D8E0BC736AE2A1ULL, 0xE9E298043589351DULL, 0xC136C1DC0CBEB930ULL}}},
+    // [19] = 19G
+    {{{0x7475656138385B6CULL, 0xF06ACFEBD7E86D27ULL, 0x93EF5CFF444F4979ULL, 0x2B4EA0A797A443D2ULL}}, {{0xB570C854E5C09B7AULL, 0x1A01F60C50269763ULL, 0xB343083B5A1C8613ULL, 0x85E89BC037945D93ULL}}},
+    // [20] = 20G
+    {{{0xF3E471B273211C97ULL, 0xF02D5290AFF74B03ULL, 0x200B559B2F7DD5A5ULL, 0x4CE119C96E2FA357ULL}}, {{0x450288EE9233DC3AULL, 0x6162948271D96967ULL, 0x5DA61FA10A844C67ULL, 0x12BA26DCB10EC162ULL}}},
+    // [21] = 21G
+    {{{0x81340AEF25BE59D5ULL, 0x1D9AD40271F81071ULL, 0x4F93FA332CE33330ULL, 0x352BBF4A4CDD1256ULL}}, {{0x67BD3D8BCF81998CULL, 0x4A1B3B2E71B1039CULL, 0xD59C18259DDA3E1FULL, 0x321EB4075348F534ULL}}},
+    // [22] = 22G
+    {{{0x99DDCB316F31E9FCULL, 0x2431741C72713B4BULL, 0x5C96FDB91C0C1E2FULL, 0x421F5FC9A2106544ULL}}, {{0xDB20717AD1CD6781ULL, 0x743034B37B223115ULL, 0x16F6DB7E225D1E14ULL, 0x2B90F16D11DABDB6ULL}}},
+    // [23] = 23G
+    {{{0xDC9CDADD4ECACC3FULL, 0xE42AB8DFEFF5FF29ULL, 0x0230010559879124ULL, 0x2FA2104D6B38D11BULL}}, {{0x423BA76B532B7D67ULL, 0x181D70ECFC882648ULL, 0xB64569335BD5DD80ULL, 0x02DE1068295DD865ULL}}},
+    // [24] = 24G
+    {{{0x0502BDA8B202E6CEULL, 0x683215439D62B794ULL, 0x8AC09C9161BA8B09ULL, 0xFE72C435413D33D4ULL}}, {{0x978ED2FBCF58C5BFULL, 0x01DC88E36B4A9D22ULL, 0xD3AB47E09D729981ULL, 0x6851DE067FF24A68ULL}}},
+    // [25] = 25G
+    {{{0x69CA0CD7F5453714ULL, 0x263C3D84E09572E2ULL, 0xAB21A9B066EDDA83ULL, 0x9248279B09B4D68DULL}}, {{0xE54A32CE97CB3402ULL, 0x3FC0DE2A887912FFULL, 0x5D1AA71BDEA2B1FFULL, 0x73016F7BF234AADEULL}}},
+    // [26] = 26G
+    {{{0x5E5CAD81710C4C8AULL, 0xC03FE1B2ABB84088ULL, 0xF40CBDEFC8E40997ULL, 0x6687CDB5B650D558ULL}}, {{0xB32E83B25C83AD64ULL, 0x0EF8E529F033F272ULL, 0x1A1FA873825C7200ULL, 0x3FD502B3111178B1ULL}}},
+    // [27] = 27G
+    {{{0x7E996D443DEE8729ULL, 0x2F570E144BF615C0ULL, 0x8E70132FB0BEB752ULL, 0xDAED4F2BE3A8BF27ULL}}, {{0xAB40E52290BE1C55ULL, 0x3F83C230F3AFA726ULL, 0xD4A1ACA87EF8D700ULL, 0xA69DCE4A7D6C98E8ULL}}},
+    // [28] = 28G
+    {{{0xC39A66F904F97968ULL, 0x6B31536DA6EB344DULL, 0xA7FA6F64D5DC3C82ULL, 0x55EB67D7B7238A70ULL}}, {{0xD0689F2F493BE3C8ULL, 0x40973BCE1C95052DULL, 0x0B1E718BF4042585ULL, 0x7D916A47B2B58140ULL}}},
+    // [29] = 29G
+    {{{0xE6A3B5E87D22E7DBULL, 0x11ECD9E9FDF281B0ULL, 0x8ACF28D7CBB19F90ULL, 0xC44D12C7065D812EULL}}, {{0xA039063F0E0E6482ULL, 0x0E106E861EDF61C5ULL, 0x76C45926C982FDACULL, 0x2119A460CE326CDCULL}}},
+    // [30] = 30G
+    {{{0x7513A49D9A688A00ULL, 0x1CCFFF21574DE092ULL, 0x0B69FC311A03F864ULL, 0x6D2B085E9E382ED1ULL}}, {{0x8DBAC47A17F388FBULL, 0x776238AA0BD5FF24ULL, 0xC739DDFA33604A83ULL, 0xACB82EB93309AD1CULL}}},
+    // [31] = 31G
+    {{{0xB61C65CBD269E6B4ULL, 0x152B695336C28063ULL, 0xC89A20CFDED60853ULL, 0x6A245BF6DC698504ULL}}, {{0xFD5E6348100D8A82ULL, 0x8B33BA48D0423B6EULL, 0x8B3F5126F16A24ADULL, 0xE022CF42C2BD4A70ULL}}},
+    // [32] = 32G
+    {{{0x75D0DBD407143E65ULL, 0xDACFFCB89904A61DULL, 0x47B6E054E2F378CEULL, 0xD30199D74FB5A22DULL}}, {{0x05B3FF1F24106AB9ULL, 0x1F760CC364ED8196ULL, 0xB3D6DEC9E9838065ULL, 0x95038D9D0AE3D5C3ULL}}},
+    // [33] = 33G
+    {{{0xF95AE57F0D0BD6A5ULL, 0xCE13300B0BEC1146ULL, 0xC077E3D2FE541084ULL, 0x1697FFA6FD9DE627ULL}}, {{0xADEE9D63D01B2396ULL, 0xA2CF15009E498AE7ULL, 0x27561506E4557433ULL, 0xB9C398F186806F5DULL}}},
+    // [34] = 34G
+    {{{0x32E8B4DA0547FC11ULL, 0x31D611B96C358B60ULL, 0xD0E80D468C344BA3ULL, 0x1BE68A5A028F2601ULL}}, {{0xFF1822F5D1F30E79ULL, 0xC076329C75146BC6ULL, 0xB3CA6265F9400779ULL, 0xBEBC47511ADE7308ULL}}},
+    // [35] = 35G
+    {{{0xF982345EF27A7479ULL, 0x9DEB8360FFB7F61DULL, 0x986D0F07E834CB0DULL, 0x605BDB019981718BULL}}, {{0x3B01E1E9056B8C49ULL, 0xC26BFAE84FB14DB4ULL, 0x81A78D93EC96FE23ULL, 0x02972D2DE4F8D206ULL}}},
+    // [36] = 36G
+    {{{0x0C899DA20F0198F9ULL, 0x5D5FEFE3388F85D9ULL, 0x0B56C563E3E5E67AULL, 0xE0392CFA338AAF2FULL}}, {{0xDFD6E3F50E7DA3ACULL, 0xBB5B10F4BD8AA51EULL, 0xEE7A347A5E4681F9ULL, 0x76D458642A2C93ADULL}}},
+    // [37] = 37G
+    {{{0xFE31C7E9D87FF33DULL, 0xDCB01C354959B10CULL, 0x7402FDC45A215E10ULL, 0x62D14DAB4150BF49ULL}}, {{0x35F5642483B25EAFULL, 0x01AA132967AB4722ULL, 0x98088A1950EED0DBULL, 0x80FC06BD8CC5B010ULL}}},
+    // [38] = 38G
+    {{{0x69CD5FDF1691FFF7ULL, 0x38E2E1FC705821EAULL, 0xA88AC16C7D80BFFDULL, 0xB699A30E6E184CDFULL}}, {{0xB745BC318A51AB04ULL, 0xD9D7268126C76A16ULL, 0x5A096EE637EBED3BULL, 0xD505700C51D860CEULL}}},
+    // [39] = 39G
+    {{{0x5E555C2F86308B6FULL, 0x2C50E9F56B9B8B42ULL, 0xDE5B4B06C408E56BULL, 0x80C60AD0040F27DAULL}}, {{0x1AA01F56430BD57AULL, 0xA65EED4CBE7024EBULL, 0x26E66BAD7FE72F70ULL, 0x1C38303F1CC5C30FULL}}},
+    // [40] = 40G
+    {{{0xF1929141BB0B4D0BULL, 0x0EACF59A33D99CD9ULL, 0x9F0E21203041BF08ULL, 0x91DE2F6BB67B1113ULL}}, {{0x9A9A2E83124A7899ULL, 0x55B03158202A9D3EULL, 0xE34E7A1009F87251ULL, 0xEB9EF6C031EED31DULL}}},
+    // [41] = 41G
+    {{{0x9D5EABB0FA03C8FBULL, 0x4CC5DC9487D84704ULL, 0xAA74C6348CC54D34ULL, 0x7A9375AD6167AD54ULL}}, {{0x02D499EC224DC7F7ULL, 0xBDC59EA10C70CE2BULL, 0x09559E0D79269046ULL, 0x0D0E3FA9ECA87269ULL}}},
+    // [42] = 42G
+    {{{0xC18ED3A3C86CE1AFULL, 0x9CB5E65CEE430558ULL, 0x1DB5833FF5F2226DULL, 0xFE8D1EB1BCB3432BULL}}, {{0xE531C573CDA9B5B4ULL, 0xFAE4DB40801A2572ULL, 0x134AC7C1D371CFFBULL, 0x07B158F244CD0DE2ULL}}},
+    // [43] = 43G
+    {{{0x4BB51F459BC3FFC9ULL, 0xBB408EC39B68DF50ULL, 0x907A9ED045447A79ULL, 0xD528ECD9B696B54CULL}}, {{0x063465B521409933ULL, 0xBC4345405C520DBCULL, 0x9966F21881FD656EULL, 0xEECF41253136E5F9ULL}}},
+    // [44] = 44G
+    {{{0xE06B70A9B3834765ULL, 0x60C180165D971A61ULL, 0x541514731622AF8DULL, 0x5D045857332D5B9EULL}}, {{0x1879A7CABF06FB68ULL, 0xA1D1F34761C6CF26ULL, 0x2DECBAB8D098A8C2ULL, 0xDB2BA972802D45FDULL}}},
+    // [45] = 45G
+    {{{0x87231808F8B45963ULL, 0x5266115E4A7ECB13ULL, 0xEA25F514E8ECDAD0ULL, 0x049370A4B5F43412ULL}}, {{0xB653052A12949C9AULL, 0x54C3F3AFBB5B6764ULL, 0x8B3081B0512FD62AULL, 0x758F3F41AFD6ED42ULL}}},
+    // [46] = 46G
+    {{{0xC16BAEDC90235717ULL, 0x980FDDE9C7E85701ULL, 0xF903B3D100E3950DULL, 0xF8B0B03D44112259ULL}}, {{0x517AB5C246242203ULL, 0xD0A986928AC79972ULL, 0x6BE1883B362F123BULL, 0xBD8E9DC301D9ADC9ULL}}},
+    // [47] = 47G
+    {{{0xF1C13EB1FC345D74ULL, 0x881D811E0E1498E2ULL, 0xD73DF930D64702EFULL, 0x77F230936EE88CBBULL}}, {{0xBE8EB3C7671C60D6ULL, 0x96C95330D97077CBULL, 0x0A08266E9BA1B378ULL, 0x958EF42A7886B640ULL}}},
+    // [48] = 48G
+    {{{0x9BD870AA1118E5C3ULL, 0xFC579B27452BEBC1ULL, 0xB441656EF4E65B4BULL, 0x6ECA335D9645307DULL}}, {{0x498A2F7805A08668ULL, 0x3A496A3A3BF8EC34ULL, 0x592F579074B875A0ULL, 0xD50123B57A7A0710ULL}}},
+    // [49] = 49G
+    {{{0xEB28531B7739F530ULL, 0x58C80074AB9D4DBAULL, 0xEA44887E5C7C0BCEULL, 0xF2DAC991CC4CE4B9ULL}}, {{0x1A117DBA703A3C37ULL, 0x9EB5FBEB0598E4FDULL, 0x4DA1F32DEC2531DFULL, 0xE0DEDC9B3B2F8DADULL}}},
+    // [50] = 50G
+    {{{0x7E8FDE79BD559A9AULL, 0x50BC64404230E7A6ULL, 0xD5F1774AEFA8F02EULL, 0x29757774CC6F3BE1ULL}}, {{0x50BD28C17C470134ULL, 0x151B423EAC4033B5ULL, 0xA0EBA45A7A41876DULL, 0xC39D07337DDC9268ULL}}},
+    // [51] = 51G
+    {{{0xBCBA4850C690D45BULL, 0x5A216CDFC9DAE3DEULL, 0x1B4BE8FBBE252012ULL, 0x463B3D9F662621FBULL}}, {{0x1CB377B01AF7307EULL, 0xC622E27C970A1DE3ULL, 0x43114306DD8622D7ULL, 0x5ED430D78C296C35ULL}}},
+    // [52] = 52G
+    {{{0xCA731921025FF695ULL, 0x7D36CFC8814C1B29ULL, 0x0294339CA3DA761FULL, 0x2B22EFDA32491A9EULL}}, {{0x30B83FD19ADC87CDULL, 0xC7048846D46ADE00ULL, 0x4C16662FC134FADCULL, 0x7ED520327080A9FAULL}}},
+    // [53] = 53G
+    {{{0xA32496B49998F247ULL, 0x6B98FAC14328A2D1ULL, 0x09232D4AFF3B5997ULL, 0xF16F804244E46E2AULL}}, {{0xD6579962C4E31DF6ULL, 0x2A6C53C26E5CCE26ULL, 0x13D206FCDF4E33D9ULL, 0xCEDABD9B82203F7EULL}}},
+    // [54] = 54G
+    {{{0x249971067C1D506BULL, 0x3447BE24500CA7A5ULL, 0x1C8331FD47A2E5FFULL, 0x4FDCB8FA639CEE44ULL}}, {{0x90F3743D00FDAEFBULL, 0x422CC82409D50796ULL, 0xAE4D91EB555010AAULL, 0x25A5208B674BFD4CULL}}},
+    // [55] = 55G
+    {{{0x369E15F7151D41D1ULL, 0x5D245315ACE27C65ULL, 0xB0352B7A14311AF5ULL, 0xCAF754272DC84563ULL}}, {{0xC32F908318A04476ULL, 0x5F4FA9B7962232A5ULL, 0xA41B643FA5E46057ULL, 0xCB474660EF35F5F2ULL}}},
+    // [56] = 56G
+    {{{0x48894A2BD3460117ULL, 0xAFE5FD8D103F827EULL, 0x27740C2BBFF05B6AULL, 0xBCE74DE6D5F98DC0ULL}}, {{0xF216512417C9F6B4ULL, 0x4F7CE5C6FC73A6F4ULL, 0x525A3E7DBF0D8D5AULL, 0x5BEA1FA17A41B115ULL}}},
+    // [57] = 57G
+    {{{0x24497BC86F082120ULL, 0x44A09C07CB86D7C1ULL, 0xF85D0F1709979D8BULL, 0x2600CA4B282CB986ULL}}, {{0x4B0BE9475A7E4B40ULL, 0x5AC6BE74AB5F0EF4ULL, 0xA693B03FCDDBB45DULL, 0x4119B88753C15BD6ULL}}},
+    // [58] = 58G
+    {{{0x742B761C49B46D3BULL, 0x764C1EF4094EE4B6ULL, 0x1540CBC9BF962CF4ULL, 0x45562F033698FACAULL}}, {{0x99025EC62B034E02ULL, 0x64558508362BC5FCULL, 0xACF931BFBD9C32A2ULL, 0x9403D11A2B419EDAULL}}},
+    // [59] = 59G
+    {{{0xC602A7746998E435ULL, 0x01C48685E24F7DC8ULL, 0x338EC53CD12220BCULL, 0x7635CA72D7E8432CULL}}, {{0xD9E76F302C5B9C61ULL, 0x4ECFC061D57048BAULL, 0x3D1D5E590F78E6D7ULL, 0x091B649609489D61ULL}}},
+    // [60] = 60G
+    {{{0xD2ACFC4D5FB8C192ULL, 0x350C778AC8A30E57ULL, 0x8FE0CF28FF1D8822ULL, 0x01257E93A78A5B7DULL}}, {{0xB54E3D341904A1A7ULL, 0xA7CC69244F295166ULL, 0x042DAD154E1116EDULL, 0x1124EC11C77D356EULL}}},
+    // [61] = 61G
+    {{{0xC1A50743BF56CC18ULL, 0xB7F2B33479D468FBULL, 0xDBBF4A87DEEE8A66ULL, 0x754E3239F325570CULL}}, {{0x0C5D98093C536683ULL, 0x23EE33D0197A695DULL, 0xB3CD0ED304EA49A0ULL, 0x0673FB86E5BDA30FULL}}},
+    // [62] = 62G
+    {{{0xBF07F6894C04F299ULL, 0x3C4D66A91706EDECULL, 0x84A271333F7FBD04ULL, 0x108443B948D15535ULL}}, {{0x5B04403DB9581A9FULL, 0xD60282D32ADFCA55ULL, 0xF055520D4DB8C49FULL, 0x4E7B5DABA34FBCF9ULL}}},
+    // [63] = 63G
+    {{{0x9FE2694691D9B9E8ULL, 0x330800661D1C952FULL, 0xFF57859C82D570F0ULL, 0xE3E6BD1071A1E96AULL}}, {{0x67002AF4920E37F5ULL, 0xA5A2283993E90C41ULL, 0x40C0AA58379A3CB6ULL, 0x59C9E0BBA394E76FULL}}},
+    // [64] = 64G
+    {{{0xE37918E6F874EF8BULL, 0xFC4C6F1DCDBAFD81ULL, 0x0B1051EAF832823CULL, 0xBF23C1542D16EAB7ULL}}, {{0x4DC37EFE66831D9FULL, 0xC522FC54811E2F78ULL, 0x7AD928A0BA5392E4ULL, 0x5CB3866FC3300373ULL}}},
+    // [65] = 65G
+    {{{0x4CC47FDCF04AA6EBULL, 0xC4CCB1F32BA35F4BULL, 0x26AE73D88F732985ULL, 0x186B483D056A0338ULL}}, {{0xA4A797F86E80888BULL, 0x21FB8090895138B4ULL, 0x2E17446E204180ABULL, 0x3B952D32C67CF77EULL}}},
+    // [66] = 66G
+    {{{0x7B54D781FF03D722ULL, 0x3A5B3ABCD29189BFULL, 0xE3A7B7B92B6C439FULL, 0x079264C4B4BFCD7FULL}}, {{0xE3071C74B063C5E1ULL, 0xAA2C8068F1845197ULL, 0x92999EE9C438D47EULL, 0x6F6F0E0784EADA9FULL}}},
+    // [67] = 67G
+    {{{0x1A8321724CE0963FULL, 0x5442E6D2B737D9C9ULL, 0x44C98561F4BE4F72ULL, 0xDF9D70A6B9876CE5ULL}}, {{0x17B8C45CF2BA2417ULL, 0xB157222720EF9DA2ULL, 0x5F862B785DC39D4AULL, 0x55EB2DAFD84D6CCDULL}}},
+    // [68] = 68G
+    {{{0x980BB7B87C78B8E9ULL, 0x4B795B416E702C1CULL, 0xB673BACB5CB7CA55ULL, 0x70E6B44A2AC6083AULL}}, {{0x4FF98B2AAE170CF8ULL, 0x0A0D0E6436DA1675ULL, 0x4173867AB5324BE4ULL, 0x49BA3203048E06D8ULL}}},
+    // [69] = 69G
+    {{{0x5DE64C5F34CE7143ULL, 0xAB52554F849ED899ULL, 0x497CA815D5DCE0F8ULL, 0x5EDD5CC23C51E87AULL}}, {{0xCDC706AB7399A868ULL, 0xC13C66C0D17A2905ULL, 0x61E8CEC030C89AD0ULL, 0xEFAE9C8DBC141306ULL}}},
+    // [70] = 70G
+    {{{0xF959C495A3BE5440ULL, 0x1FB66F6861C84A35ULL, 0x4F1420DD3B90D344ULL, 0xC00BE8830995D1E4ULL}}, {{0xA2043E7791C51BB7ULL, 0x56EFE24D228BFE6EULL, 0x0DE652A340600C73ULL, 0xECF9665E6EBA4572ULL}}},
+    // [71] = 71G
+    {{{0x722D362F84614FBAULL, 0x7AA3FBA1C355B17AULL, 0xDA12FE02287E9E77ULL, 0x290798C2B6476830ULL}}, {{0x6D003AFD41943E7AULL, 0x5B29C094DB2A2314ULL, 0x988D00BCF79AF25DULL, 0xE38DA76DCD440621ULL}}},
+    // [72] = 72G
+    {{{0x659032865FF5154CULL, 0x1E988D693DF4A1FBULL, 0xECB4B17F84F42D8CULL, 0xA8F2C94E19D9D829ULL}}, {{0xF9DDC14E86BE1EBFULL, 0xFAD3DA15D691EFA4ULL, 0x462E21F336A8971DULL, 0x3F1D72D253A01DFCULL}}},
+    // [73] = 73G
+    {{{0x62DFDECEF4053B45ULL, 0xCD29552FE3602573ULL, 0x054754EFA150AC39ULL, 0xAF3C423A95D9F5B3ULL}}, {{0xBC2FEDED498FD9C6ULL, 0xC8CD5AA667A15581ULL, 0x9A93B0E6F35CFB40ULL, 0xF98A3FD831EB2B74ULL}}},
+    // [74] = 74G
+    {{{0x6E37B93C5C478840ULL, 0xFD6B072C4FBB8D47ULL, 0x9C052CEBBFBB7E9DULL, 0x2773840FCF4E9E45ULL}}, {{0x9D3A95324E543C49ULL, 0x9AFD48BBC2A2CFB4ULL, 0x74EAA876AA416CF5ULL, 0xCC26479830E10370ULL}}},
+    // [75] = 75G
+    {{{0x8D2FED50D884249AULL, 0x06BB66B26DCF98DFULL, 0xCCCAA28C99BF2749ULL, 0x766DBB24D134E745ULL}}, {{0x2C924F97CBAC5996ULL, 0x97584A65FA06CEDDULL, 0x8DCC887980DA38B8ULL, 0x744B1152EACBE5E3ULL}}},
+    // [76] = 76G
+    {{{0x3FE397C5B3300B23ULL, 0xAC44BD64C7BAE07CULL, 0x278D0D7420A88DF0ULL, 0x96516A8F65774275ULL}}, {{0x7F6BF255F1337FF0ULL, 0xB2F75AB36207E155ULL, 0x108C0A99D567FBA9ULL, 0xBDACD9A05FB9FB73ULL}}},
+    // [77] = 77G
+    {{{0xCE92E666191ABE3EULL, 0x45F7B44F6C596A58ULL, 0xA21277C33784F416ULL, 0x59DBF46F8C94759BULL}}, {{0xD85E216C4A307F6EULL, 0x42CE739A7919798CULL, 0x0F4EA6CE648309A0ULL, 0xC534AD44175FBC30ULL}}},
+    // [78] = 78G
+    {{{0xBB3D3D987058C8AEULL, 0x0E7E555BD9114950ULL, 0x7EFE354DB9F95FE7ULL, 0x2DDF7BBCFE114E80ULL}}, {{0xEB13F199399F4EC9ULL, 0x90F3408491C470B4ULL, 0x2E754603B426BC0DULL, 0xEC93E49C88FC8565ULL}}},
+    // [79] = 79G
+    {{{0xB62DC6018CFD87B8ULL, 0xDD647E711A95E73CULL, 0x305E691E74E9A4A8ULL, 0xF13ADA95103C4537ULL}}, {{0x0778419BDAF5733DULL, 0x6949E21A6A75C257ULL, 0x63BF4BC808341F32ULL, 0xE13817B44EE14DE6ULL}}},
+    // [80] = 80G
+    {{{0x0ECD31E14F87F62EULL, 0x10E6E63863716127ULL, 0x0D7C744ED34659F0ULL, 0xE9623BBEF1BF90ECULL}}, {{0x53013EAFA44EE737ULL, 0xFE6043C9DD68844EULL, 0xE0FE953A8EDAA929ULL, 0x38A9743B4BC299E9ULL}}},
+    // [81] = 81G
+    {{{0x488550015A88522CULL, 0xDA1869C06EBADFB6ULL, 0x6D4167A2C59CCA4CULL, 0x7754B4FA0E8ACED0ULL}}, {{0x37A48B57841163A2ULL, 0x8D1E4E350B6CBCC5ULL, 0x224B967C3020B8FAULL, 0x30E93E864E669D82ULL}}},
+    // [82] = 82G
+    {{{0x9E594FECC13B59DFULL, 0xBE89B397B454C8B5ULL, 0x0A37C28E771C6CB4ULL, 0xE35BC6BB1B05B213ULL}}, {{0xC128B757CDD92ACBULL, 0x358EB4E66A331B76ULL, 0x9C4D07D56A198DECULL, 0x21868874CC2CB5A7ULL}}},
+    // [83] = 83G
+    {{{0xA6828C99E2262519ULL, 0x01858F95DE8041D2ULL, 0xAA3874D46ABEF9D7ULL, 0x948DCADF5990E048ULL}}, {{0xCBBA2CAE5347D57EULL, 0xDF9154EFBD2EF1D2ULL, 0xD5D28A3224B1BC25ULL, 0xE491A42537F6E597ULL}}},
+    // [84] = 84G
+    {{{0xE5626BAAF6812379ULL, 0xA1ECDBABDCFCCD39ULL, 0xD3330A7F05A58614ULL, 0x87C01E27D84DA2DBULL}}, {{0x0E5EC95EE2A1ECEEULL, 0x420E76859E59E54EULL, 0x64EF68644823BE8AULL, 0x90E9991A7304206AULL}}},
+    // [85] = 85G
+    {{{0x70328A8A3D7C77ABULL, 0xFB224CF5AC0BFA15ULL, 0x89C7B48F8202EC37ULL, 0x7962414450C76C16ULL}}, {{0x60AFA5B29DB83437ULL, 0x12507A051F04AC57ULL, 0x0D5C1FC133EF6F6BULL, 0x100B610EC4FFB476ULL}}},
+    // [86] = 86G
+    {{{0xE4749682DE46EEACULL, 0x9DE2D0E222575F22ULL, 0x070FB906BCED4409ULL, 0x497C83C39C76E56DULL}}, {{0xA7ED795B923B9722ULL, 0x7AE69493FDA866F8ULL, 0x4653A557449FF8B2ULL, 0x9807DA341A297EE8ULL}}},
+    // [87] = 87G
+    {{{0xB0DD085137EC47CAULL, 0x5A16977225B8847BULL, 0xB15B160644D91548ULL, 0x3514087834964B54ULL}}, {{0x7E7D15A0DE293311ULL, 0x6039E77C15C2378BULL, 0x8E1652C48E8127FCULL, 0xEF0AFBB205620544ULL}}},
+    // [88] = 88G
+    {{{0xF7086353A80C44FEULL, 0x16D1CFDA1B054DA5ULL, 0x3D81D3E1EF66CDABULL, 0xA8AF384E794930E6ULL}}, {{0xE3AB823D6581CC28ULL, 0xAF9915F0377906F1ULL, 0xCB32648C493AF7DEULL, 0xA24D6D07EDE1CEDEULL}}},
+    // [89] = 89G
+    {{{0x42943D3F7B527EAFULL, 0x93E947EB8DF787B4ULL, 0xC79CE2C9DD8BC549ULL, 0xD3CC30AD6B483E4BULL}}, {{0xAFB34DB04EEDE0A4ULL, 0x3C2AD46290358630ULL, 0x89C5E9BE8F9508AEULL, 0x8B378A22D827278DULL}}},
+    // [90] = 90G
+    {{{0x2AF2E606110CC919ULL, 0x216CBBC90D97AED6ULL, 0xFE540E4B0664410FULL, 0xEB49FD9F510469F4ULL}}, {{0x4C481324A6C8912BULL, 0x5D6406CBFCD76E17ULL, 0x34DB14F93706891DULL, 0x6E638DF7A9105BBCULL}}},
+    // [91] = 91G
+    {{{0x3975BA0FF4847610ULL, 0x2B29823DB913F649ULL, 0xCE1C78FCBFEFE08BULL, 0x1624D84780732860ULL}}, {{0xCC06E2A404078575ULL, 0x896878F5282BE4C8ULL, 0x0914448C6CD9D4CAULL, 0x68651CF9B6DA903EULL}}},
+    // [92] = 92G
+    {{{0xF6639D49C8704818ULL, 0xD3A6172D6511C68BULL, 0xB435DB84A21605A7ULL, 0xDE1D35CBC6308CC5ULL}}, {{0x75D5E1F0201F1DEDULL, 0x823AC662E052FA27ULL, 0x2AAF43C6B4E4EBF1ULL, 0xD03CE0B8EF7AA8AAULL}}},
+    // [93] = 93G
+    {{{0x6DF7B4FD5FC61CD4ULL, 0x5192474B5AF207DAULL, 0x6902C95633E62A98ULL, 0x733CE80DA955A8A2ULL}}, {{0xC54673BC1DC5EA1DULL, 0x3E1EF8E0201E4578ULL, 0x485A4D8B8DB9FCCEULL, 0xF5435A2BD2BADF7DULL}}},
+    // [94] = 94G
+    {{{0xBF6DCD5710E682F2ULL, 0xC134BCD7D6F35919ULL, 0x24120CA18648961AULL, 0x84DF2E6E5E84CDFFULL}}, {{0x79B16D545167625EULL, 0x8935E6D57F30002AULL, 0xC5339C7D978E3B74ULL, 0x1D1D201C7C29525CULL}}},
+    // [95] = 95G
+    {{{0xEF258DFAB81C045CULL, 0x8966C5092171E699ULL, 0xCF1A1C33BBD3B49FULL, 0x15D9441254945064ULL}}, {{0xFC37BBE9EFE4070DULL, 0x434800BACEBFC685ULL, 0x34F5137B73B84177ULL, 0xD56EB30B69463E72ULL}}},
+    // [96] = 96G
+    {{{0x43933ACA7F8CB0E3ULL, 0xA22EB53FE1EFE3A4ULL, 0x8FA64E044B2EB72EULL, 0x3F0E80E574456D8FULL}}, {{0xCB0289E2EA5F404FULL, 0x9501253AA65B53A4ULL, 0xE90B9C08485D01B3ULL, 0xCB66D7D7296CBC91ULL}}},
+    // [97] = 97G
+    {{{0xAC138599D0717940ULL, 0x1C21417C9D2B8AAAULL, 0xB612136E5CE70D27ULL, 0xA1D0FCF2EC9DE675ULL}}, {{0x19212D39C197A629ULL, 0x641462A54070F3D5ULL, 0xB2E90737309667F2ULL, 0xEDD77F50BCB5A3CAULL}}},
+    // [98] = 98G
+    {{{0xD637AB63EF91E5B4ULL, 0x191110FD2E9122ABULL, 0x39BF1C39D65F194DULL, 0x4752F85486208311ULL}}, {{0x654F3EE5C9E6C1C2ULL, 0xB6F36B14FBF54AD1ULL, 0x6EC19E9CE26AE4BDULL, 0xC80F1D852659B418ULL}}},
+    // [99] = 99G
+    {{{0xC7CA37331CB36980ULL, 0xA790BADEE8245C06ULL, 0x5780C0735F84DBE9ULL, 0xE22FBE15C0AF8CCCULL}}, {{0xE43D06D77D31DA06ULL, 0xA38289154964799BULL, 0x88B430A69F53A1A7ULL, 0x0A855BABAD5CD60CULL}}},
+    // [100] = 100G
+    {{{0x0221B4CEF7500F88ULL, 0x3EE306B3406A2689ULL, 0x2E174C835FB72BF5ULL, 0xED3BACE23C5E1765ULL}}, {{0xFCE17AD5E335286EULL, 0x97BD17BE084895D0ULL, 0xDCDA5E8A7A1F87BFULL, 0xE57A6F571288CCFFULL}}},
+    // [101] = 101G
+    {{{0x4009452246CFA9B3ULL, 0x69635E394704EAA7ULL, 0x0EE13473C1155F5FULL, 0x311091DD9860E8E2ULL}}, {{0xBD80F0B1286D8374ULL, 0x871EC5A64FEEE685ULL, 0xFFD1F04788C06830ULL, 0x66DB656F87D1F04FULL}}},
+    // [102] = 102G
+    {{{0x00E5D46389103C7EULL, 0x74E3A1B9D30671F8ULL, 0xD9BED6F42DC6A289ULL, 0x3049F7FFC71D744BULL}}, {{0xC7032F99470BEF44ULL, 0xDFEFDEFD1262BCA4ULL, 0x7F86709D01D2B66EULL, 0xFAE7BC16185FC1A6ULL}}},
+    // [103] = 103G
+    {{{0x1867D4232EC2DBDFULL, 0x883928B45A934078ULL, 0xB31C0442D3E6AC24ULL, 0x34C1FD04D301BE89ULL}}, {{0xC5321857BA73ABEEULL, 0xD57F1CEEB487443DULL, 0x54BD46F730174136ULL, 0x09414685E97B1B59ULL}}},
+    // [104] = 104G
+    {{{0x203F636EE00926DCULL, 0xDB0DF90ECD4C9483ULL, 0x1FB52A688D9D6FE6ULL, 0x1880C9AD32FBB07EULL}}, {{0x0E6DB815548473CCULL, 0x99AC0B24E3A90C27ULL, 0x0B7F1C9750E28AFEULL, 0xA20C096CF36367BFULL}}},
+    // [105] = 105G
+    {{{0xCC2A5E6B049B8D63ULL, 0x8D13F3ABBCD08AFFULL, 0x1C14DE5B557EB42AULL, 0xF219EA5D6B54701CULL}}, {{0xD8C2962A400766D1ULL, 0xF4B08D3C07B27FB8ULL, 0xF73AF4544CCCF6B1ULL, 0x4CB95957E83D40B0ULL}}},
+    // [106] = 106G
+    {{{0x90C7F04F8ACCB725ULL, 0x888043B17BCBE914ULL, 0x72310DB34C1E79F3ULL, 0x1FC757D383E42507ULL}}, {{0x2F80FD5DC15E76BDULL, 0x9A859739BEA9B37EULL, 0x9297FF08E74DF0BDULL, 0xB4D0E7EF521C1C81ULL}}},
+    // [107] = 107G
+    {{{0x7236912469A0B448ULL, 0x543A5490BCA62708ULL, 0xB1F683DB8F45DE26ULL, 0xD7B8740F74A8FBAAULL}}, {{0x411E0315EAA4593BULL, 0xFF15DB5ED3C049B3ULL, 0xE1010F337AD4717EULL, 0xFA77968128D9C92EULL}}},
+    // [108] = 108G
+    {{{0x81C5845BB834C21EULL, 0x853B0F22B8925D5DULL, 0x20391CEF85374576ULL, 0x7E660BEDA020E9CCULL}}, {{0x21EAEF2C7208E409ULL, 0x6A8FEDC6F9E8EAD4ULL, 0x806527D1DAF1BBB9ULL, 0x2D114A5EDB320CC9ULL}}},
+    // [109] = 109G
+    {{{0x9FE4D3091AA824BFULL, 0xAD5BCD32ABDD9428ULL, 0xF86F7C98D3A3335EULL, 0x32D31C222F8F6F0EULL}}, {{0x118D14B8462E1661ULL, 0x2E6DAC9E6F26E961ULL, 0x9CCD3D7915B9E1DAULL, 0x5F3032F5892156E3ULL}}},
+    // [110] = 110G
+    {{{0xF745DDAA42583D11ULL, 0x7B00F024A9728087ULL, 0xFA735FC4FCD0AB7CULL, 0x3BB9AEC1F1EB9EC7ULL}}, {{0x21EE1BAEF2BB04CDULL, 0xCD14D9DD764D4726ULL, 0x6AF5B9DD4A6600D7ULL, 0x9AE0247B2342180CULL}}},
+    // [111] = 111G
+    {{{0x340F86CBC18347B5ULL, 0x8793D77CD59592C4ULL, 0x71045A155D9831EAULL, 0x7461F371914AB326ULL}}, {{0xB39847B3CC092FF6ULL, 0x2EEE1FF50C986EA6ULL, 0xCBDDDCAE0AA44254ULL, 0x8EC0BA238B96BEC0ULL}}},
+    // [112] = 112G
+    {{{0xEB0AADF82A8D733CULL, 0xFFC274BF62FCA8F9ULL, 0x0884A36F2080D682ULL, 0xBC82DD73E5161DBAULL}}, {{0x1E786104F47797F0ULL, 0xAE93A0BAE7389730ULL, 0x54A9B4BF719F02DFULL, 0xE5F28C3A044B1CACULL}}},
+    // [113] = 113G
+    {{{0x287698BAD7B2B2D6ULL, 0x6D716B2C3E67453DULL, 0x74356A25AA38206AULL, 0xEE079ADB1DF18600ULL}}, {{0xEBAAC479EC1C8C1EULL, 0xA446989AF04C4E25ULL, 0x4C5F37E0ECC5F9F6ULL, 0x8DC2412AAFE3BE5CULL}}},
+    // [114] = 114G
+    {{{0xBD95EC557A93EAB5ULL, 0x88D6B130B16695E5ULL, 0x93CC339096D66AD5ULL, 0xB74F0C165B4A9435ULL}}, {{0x3B98E9611F5DC208ULL, 0x90AB454E65E5EC9EULL, 0xBC306C9B6C15494AULL, 0x646FA5B5FCDAD2D3ULL}}},
+    // [115] = 115G
+    {{{0x2BFD8616BA9DA6B5ULL, 0xE65DE331874C9DC7ULL, 0x467B18302EE620F7ULL, 0x16EC93E447EC83F0ULL}}, {{0x9626778E25B0674DULL, 0x9D58186A50E49713ULL, 0xD0E8C2A7CA5804A3ULL, 0x5E4631150E62FB40ULL}}},
+    // [116] = 116G
+    {{{0x9306FE7F8957F489ULL, 0xEF6CC374CE143846ULL, 0xF81EEE193A3AF355ULL, 0xFC6040FE245682CDULL}}, {{0x5D4E075E32808785ULL, 0xED8BD517407373FDULL, 0xF656A354B9C92684ULL, 0x28312A55765D0435ULL}}},
+    // [117] = 117G
+    {{{0x85B96065D537BD99ULL, 0xD8855897F98B6AA4ULL, 0x38978290AFA70B6BULL, 0xEAA5F980C245F6F0ULL}}, {{0xB18041024EDC07DCULL, 0xD784869D7E6EA67FULL, 0x19A528391C994624ULL, 0xF65F5D3E292C2E08ULL}}},
+    // [118] = 118G
+    {{{0x3EC1775D0FADAE00ULL, 0x1DC81F9C32BB84A5ULL, 0x53DE84833CCFFDB3ULL, 0xA7C0EA7395D87852ULL}}, {{0xF58513F8FB152BCEULL, 0x19E16B89CE982871ULL, 0x3F876FF45961A83CULL, 0xA26BECC5EA1819D3ULL}}},
+    // [119] = 119G
+    {{{0xA96C4B6B35A49F51ULL, 0x58AE04877151342EULL, 0x692EE1910A024399ULL, 0x078C9407544AC132ULL}}, {{0x62B675F194A3DDB4ULL, 0xFA1FBD583C064D24ULL, 0xD5404795539A5E68ULL, 0xF3E0319169EB9B85ULL}}},
+    // [120] = 120G
+    {{{0x9CAA00F574ADC826ULL, 0x89E7020E8E0BECB7ULL, 0xBD3FF25E9D1667FAULL, 0xDD5BA67CFB807824ULL}}, {{0x94A0753A915B644CULL, 0x42425D84290545F2ULL, 0xD0D6E193AAAF5A56ULL, 0xD6B837116FA89FA1ULL}}},
+    // [121] = 121G
+    {{{0x726578D9702857A5ULL, 0x01CDC8AE7A6FC688ULL, 0x16DCD838431AEA00ULL, 0x494F4BE219A1A770ULL}}, {{0x55F4B031880D562CULL, 0xF925CE30D767ED6EULL, 0x39BA7F075E36BA2AULL, 0x42242A969283A5F3ULL}}},
+    // [122] = 122G
+    {{{0xE0A3BFDA73176237ULL, 0x7BF7DDAF568A5FB9ULL, 0xD23F25EFBA0F6DD8ULL, 0x139AE46A1133F1F9ULL}}, {{0x3E6EC481A8991472ULL, 0xB8A5FFBEB480BA0EULL, 0x63FD238833A12188ULL, 0x00995E555C8AABD2ULL}}},
+    // [123] = 123G
+    {{{0xBF4C1E665C1FE9B5ULL, 0xD28211EA58FAA70EULL, 0x6BC7F2F5144EA549ULL, 0xA598A8030DA6D86CULL}}, {{0x10026DBD2D864E6BULL, 0x23FC63B65B35F86AULL, 0x7E4B4A7140737AECULL, 0x204B5D6F84822C30ULL}}},
+    // [124] = 124G
+    {{{0x9A7B09B1029471E3ULL, 0xB8FFEA50EC08422AULL, 0x685BB8C12419BBF5ULL, 0xF90B89D53BDC724AULL}}, {{0x7048C13FEB4785F6ULL, 0x1A652CB086EE45D5ULL, 0x1AAA132D75F7515FULL, 0x672BD987C7E383BAULL}}},
+    // [125] = 125G
+    {{{0x4DBADC3E58595997ULL, 0x208F020F12570A18ULL, 0x09192F5F2DBEAFECULL, 0xC41916365ABB2B5DULL}}, {{0xED16E96B58FA9913ULL, 0xD5CAF9450F34BFC0ULL, 0x49D245B328984989ULL, 0x04F14351D0087EFAULL}}},
+    // [126] = 126G
+    {{{0x6938AD32C494B319ULL, 0x9F055DD3C1C7E533ULL, 0x2E1E0BA01AD1A0F8ULL, 0x6DF7B5A7A126A611ULL}}, {{0xEB09520A981FDF32ULL, 0xA81EFA6B414A583EULL, 0xB290CF45325AF0B4ULL, 0x9E2599B420982535ULL}}},
+    // [127] = 127G
+    {{{0xE4C73A5514742881ULL, 0x92A2E0D2E0A36ACFULL, 0x5A724604DA03BC5BULL, 0x841D6063A586FA47ULL}}, {{0xE7A36DE01A8D6154ULL, 0xE62562D6744C169CULL, 0x1904F9A1C7543698ULL, 0x073867F59C0659E8ULL}}},
+    // [128] = 128G
+    {{{0x647077456769A24EULL, 0xBCF55CD700535655ULL, 0x696C3D09F7D1671CULL, 0x34FF3BE4033F7A06ULL}}, {{0x8491067A73CC2F1AULL, 0x55DF16C3E8F8B681ULL, 0x3F6619D89832098CULL, 0x5D9D11623A236C55ULL}}},
+    // [129] = 129G
+    {{{0xED112AC4D70E20D5ULL, 0x282B33810928BE4DULL, 0x76026947F89BDE2FULL, 0x5E95BB399A6971D3ULL}}, {{0x161384C746012865ULL, 0xA99C9AED7D8BA38BULL, 0xEEBFC71181313775ULL, 0x39F23F366809085BULL}}},
+    // [130] = 130G
+    {{{0x6E731B06C6F51CD8ULL, 0xA0E70ED205C5E94DULL, 0x74E67F1D7052F398ULL, 0x9DDA94404337DB14ULL}}, {{0x7D5FA49229D31669ULL, 0x306A0A11FDD22B0DULL, 0xAE6FAE38ED6D2EC4ULL, 0x0065A58128F755AFULL}}},
+    // [131] = 131G
+    {{{0xF99471BCA0EF2F66ULL, 0x5EC07564B5315D8BULL, 0x76C39F8A99FD974EULL, 0x36E4641A53948FD4ULL}}, {{0x6FD51CF5694C78FCULL, 0x56EA13493FD563E0ULL, 0x164227B085C9AA94ULL, 0xD2424B1B1ABE4EB8ULL}}},
+    // [132] = 132G
+    {{{0x45D2AE2AE38947D7ULL, 0x7ED3C170C45E44D4ULL, 0x361BCD154301FF4BULL, 0x8A93046D22897B40ULL}}, {{0xE9002DCCB1AF50CEULL, 0x43DDF472FBB16491ULL, 0x29CA19B9110C315BULL, 0xB227F7D021263C6FULL}}},
+    // [133] = 133G
+    {{{0xAEAB27C2C579F726ULL, 0xF5643842170E914FULL, 0x90C191A2F507A41CULL, 0x0336581EA7BFBBB2ULL}}, {{0xF3DCDCABD2FDA224ULL, 0x91F7AB1410CD1E0EULL, 0x99252129B6E56B33ULL, 0xEAD12168595FE1BEULL}}},
+    // [134] = 134G
+    {{{0x2B1F39BEC59B9618ULL, 0xF17D3F1F5EEAFB4EULL, 0x75E8B46DC5A91925ULL, 0xD5F66020BDD383A8ULL}}, {{0x17C5DE9E6F3AA216ULL, 0x879B9AB8E9B75D4AULL, 0x11263A75D9328A1CULL, 0x8F8C3EEC190DF3D1ULL}}},
+    // [135] = 135G
+    {{{0x849742706BD43EDEULL, 0x03781025ED6890C4ULL, 0xA1F2634FCF00EC84ULL, 0x8AB89816DADFD6B6ULL}}, {{0x58A47A9129CDD24EULL, 0x503D459C3E898458ULL, 0x44E654AEF624136FULL, 0x6FDCEF09F2F6D0A0ULL}}},
+    // [136] = 136G
+    {{{0x3F667F69D0D97018ULL, 0xAFE835FECA1575E9ULL, 0x5F5F8D2AAF30FC6DULL, 0xF25F6E271E231DFDULL}}, {{0x369EE69A35B4AF25ULL, 0x8BE2FF17F252CEBDULL, 0xD2946AF2A8737BB6ULL, 0xBAB2192B75324599ULL}}},
+    // [137] = 137G
+    {{{0x4BB40284B8C5FB94ULL, 0x20B0938E8ACFF254ULL, 0x8133344D9299FCAAULL, 0x1E33F1A746C9C577ULL}}, {{0xE33A7D2057F3B3B6ULL, 0x2306D320F1D03010ULL, 0xA9C8ED618D24EDFFULL, 0x060660257DD11B3AULL}}},
+    // [138] = 138G
+    {{{0x5EA937913CCF1095ULL, 0x6F0328BC6EDA337BULL, 0x9541A803535B09DCULL, 0x0F1DD626B9722019ULL}}, {{0xFEB77705FC25F516ULL, 0xE17549340A46831AULL, 0x4286AE3F103A2074ULL, 0xF46BFB389FDB7CE4ULL}}},
+    // [139] = 139G
+    {{{0xA410361FD8F08F31ULL, 0x0ED1F4CC18CBCFCFULL, 0xEE7F30DED79DD20AULL, 0x85B7C1DCB3CEC1B7ULL}}, {{0xC6FED3C35E999511ULL, 0xFCAFAD1895D7A633ULL, 0xF39048F25A8847F4ULL, 0x3D98A9CDD026DD43ULL}}},
+    // [140] = 140G
+    {{{0xB92D2F1129289FA9ULL, 0xFA4ACB89CD7D9487ULL, 0x888C0A54CE408B48ULL, 0x9358BF4E626CE79AULL}}, {{0x5530A39D2E8D7639ULL, 0xB34905A2087E6A25ULL, 0x57337B85CCACBB62ULL, 0x5AF11032704E83D0ULL}}},
+    // [141] = 141G
+    {{{0x72A2800661AC5F51ULL, 0x7FBE9A3B878A7AF8ULL, 0x9275F4B125D6D45DULL, 0x29DF9FBD8D9E4650ULL}}, {{0xCD2876EB2A27D84BULL, 0xDA61DC861C019E55ULL, 0x6E2D8862179139FFULL, 0x0B4C4FE99C775A60ULL}}},
+    // [142] = 142G
+    {{{0xC9F81B66FF472ADBULL, 0xB5E571AF914FE014ULL, 0x6ADC31B4E7830036ULL, 0xEF68A2C7AD33241DULL}}, {{0x786EF55EBE29887EULL, 0x2ABE221A176D0E2EULL, 0xE8842C4BFD67C46CULL, 0x202632E371066766ULL}}},
+    // [143] = 143G
+    {{{0x8082B2E449FCE252ULL, 0xDFE58CA2F768105CULL, 0x3FEA6E671AAF8ADFULL, 0xA0B1CAE06B0A847AULL}}, {{0x50F049503A296CF2ULL, 0x6B72DA1834AFF0E6ULL, 0xEC4B19D917A6A28EULL, 0xAE434102EDDE0958ULL}}},
+    // [144] = 144G
+    {{{0xD7EFE2315FBC7671ULL, 0x743F1BC852858E32ULL, 0xD20291CE1798F490ULL, 0x8E3D1248C7657211ULL}}, {{0x7EF1DC6418717DECULL, 0xB9352BAAA63E144AULL, 0xF64480E19393E90EULL, 0x099A48E10ECFCB81ULL}}},
+    // [145] = 145G
+    {{{0xA113F2E4C0E121E5ULL, 0xB499DFB3B2133E4BULL, 0x36DC7FF67E840295ULL, 0x04E8CEAFB9B3E9A1ULL}}, {{0xB827CE62A326683CULL, 0x422C086A63460502ULL, 0x4B48F6D534CE5C79ULL, 0xCF2174118C8B6D7AULL}}},
+    // [146] = 146G
+    {{{0x5DFB298429952152ULL, 0x1CF5E707C8F3050DULL, 0x08A0E679D9EEA6A8ULL, 0x7B732AF34077F331ULL}}, {{0x8F163904BAD1C7CFULL, 0x3E0012F6AF5C01DFULL, 0xB92FD08559EE2A71ULL, 0x17C4D13C535BE360ULL}}},
+    // [147] = 147G
+    {{{0xF42725C2B789A33BULL, 0x0A5076689A010919ULL, 0x5AFB81C7CA2F6908ULL, 0xD24A44E047E19B6FULL}}, {{0x2CDEC417AFEA8FA3ULL, 0x013F996887B8244DULL, 0xC63DB50F1C0F1C69ULL, 0x6FB8D5591B466F8FULL}}},
+    // [148] = 148G
+    {{{0xDF051B79DA14B6C3ULL, 0x6F02C24FBB10AE46ULL, 0x2718197EF17ED087ULL, 0xECC99B0CF89EF141ULL}}, {{0x6D5C41A70C1E9FDBULL, 0xE7C5F702206DC0E8ULL, 0x598A5284FC790673ULL, 0x04ABCDD05201E8BDULL}}},
+    // [149] = 149G
+    {{{0x5104E98E8E3B35D4ULL, 0x001EDD28ABBAB77BULL, 0x249FDFCFACB99584ULL, 0xEA01606A7A6C9CDDULL}}, {{0xCFD652188A3EA98DULL, 0xB7D4494BC2823700ULL, 0xCFBFE369F7A7B3CDULL, 0x322AF4908C7312B0ULL}}},
+    // [150] = 150G
+    {{{0xB908EA95E5EEBBEFULL, 0x09B16386BDE7F857ULL, 0x0C128AC00A410976ULL, 0x1F6014569D1203AEULL}}, {{0x91475348AC0DCE51ULL, 0xAFE9F96231D1D1C2ULL, 0x5A75A2A70908F483ULL, 0x82B83F8D79EC4B86ULL}}},
+    // [151] = 151G
+    {{{0x4AD196DE8CE2131FULL, 0x252007D8C5EA31BEULL, 0x6C6328655EB96651ULL, 0xAF8ADDBF2B661C8AULL}}, {{0xF3DFBCDB71749700ULL, 0x2520818680E26AC8ULL, 0x2A034EAFD096836BULL, 0x6749E67C029B85F5ULL}}},
+    // [152] = 152G
+    {{{0x419EB6997DEE8D17ULL, 0x2F127B76FF24D7B8ULL, 0xB603B7D515377322ULL, 0xE19D8D416B28EEEFULL}}, {{0x266E2D163FC83D99ULL, 0x0E2268C7D1679757ULL, 0x0FC534D42AECC459ULL, 0xA54B0056FBEB471BULL}}},
+    // [153] = 153G
+    {{{0x722F0E3450F45889ULL, 0xA674A3DABCFCA15EULL, 0x6CC516D47E0FB165ULL, 0x00E3AE1974566CA0ULL}}, {{0x3420A72EEB0BD6A4ULL, 0x0DE97E4874F81F53ULL, 0x16217F07BF4D0730ULL, 0x2AEABE7E45315101ULL}}},
+    // [154] = 154G
+    {{{0x8E7B0A261F997190ULL, 0x4A03A9C0107E1D63ULL, 0xBF7257C3B588E75BULL, 0x9EA5C218B98CC990ULL}}, {{0xBD249EEB28A2FEA2ULL, 0x9FABF3E9A060BD70ULL, 0xE74E6B0C79B53775ULL, 0xA049B1F4EEFC6732ULL}}},
+    // [155] = 155G
+    {{{0x075EA8CED397E246ULL, 0x01993FF3ED258802ULL, 0x1CF6993FFED1E3E3ULL, 0x591EE355313D9972ULL}}, {{0xEEE98F1A4BE5D196ULL, 0x1FF0B053D25CA2BDULL, 0xA60FC4775460C790ULL, 0xB0EA558A113C30BEULL}}},
+    // [156] = 156G
+    {{{0xD7A17C18F15A3699ULL, 0x5E603EB6750077ACULL, 0x5F13C7CC84C166D5ULL, 0xA8BE67D40815919CULL}}, {{0x65A2B31F88196C47ULL, 0xBAB1D00DB0DBC03AULL, 0x189B5D017F8FDB76ULL, 0x6DB068BBF5499243ULL}}},
+    // [157] = 157G
+    {{{0x077CF03255B52984ULL, 0xFA8584E47B084945ULL, 0xF19AA97318D8DA61ULL, 0x11396D55FDA54C49ULL}}, {{0xC5767BEA93EA57A4ULL, 0x4FF536B01B257BE4ULL, 0x289D5833A7BEB474ULL, 0x998C74A8CD45AC01ULL}}},
+    // [158] = 158G
+    {{{0x0F734AFB0A29F390ULL, 0xA53573822A6E94B3ULL, 0x36ECBE198E90FE71ULL, 0x915050C28C39EBFDULL}}, {{0xC121316A8DED4293ULL, 0x87A558DADAE0C580ULL, 0xDE8682090B6EC098ULL, 0x51559BE325B4D6D6ULL}}},
+    // [159] = 159G
+    {{{0x05540157E017AA7AULL, 0x8DCDFD5468754B64ULL, 0x90000738C9E0C40BULL, 0x3C5D2A1BA39C5A17ULL}}, {{0x61F79CA4C81BD257ULL, 0x0F9B8B9FDD270F66ULL, 0xF9D4DE7396FC18B8ULL, 0xB2284279995A34E2ULL}}},
+    // [160] = 160G
+    {{{0x05EC32AD51B03F6CULL, 0xA4D047122A9B184BULL, 0x2BC776838F73F576ULL, 0x308913A27A52D922ULL}}, {{0x60AB5EFCE8FE4C67ULL, 0xA8333FEA82BD1F12ULL, 0x91E3531F66C0375DULL, 0xF4A5B09543FEBE5FULL}}},
+    // [161] = 161G
+    {{{0x425EF8A1793CC030ULL, 0xFBC395AFB04AC078ULL, 0xA3A99A7299F2E9C3ULL, 0xCC8704B8A60A0DEFULL}}, {{0x940B74E3AC1F1B13ULL, 0xF395B74FC4BCDC4EULL, 0x1D1E0862DB347F8CULL, 0xBDD46039FEED1788ULL}}},
+    // [162] = 162G
+    {{{0x22109700780A7943ULL, 0x83FF4AC34A966EB8ULL, 0x97A3B8BC51BFA271ULL, 0xFBAF4EB5BDF8FE93ULL}}, {{0x52C0BB205D654A9DULL, 0x8209F6506FE4C0FFULL, 0x6571DE2ED92BCC04ULL, 0x36E7FF517AD79FABULL}}},
+    // [163] = 163G
+    {{{0xA204119B2889B197ULL, 0x7DD4DEFCCC53EE7EULL, 0xCD9777AC5CAD29B9ULL, 0xC533E4F7EA8555AAULL}}, {{0xBB8E0F45EB596096ULL, 0xD9B925BB4A4B3A26ULL, 0x9A2FB6242F1A43A2ULL, 0x6F0A256BC5EFDF42ULL}}},
+    // [164] = 164G
+    {{{0xA218A7BDA715E7BAULL, 0xB77BEEB53920DB82ULL, 0x91DD96717159E106ULL, 0xF62885CE55FF7BE2ULL}}, {{0x7EB8538D1DA95407ULL, 0x52BFE6A7B0DEAB60ULL, 0x656DF2F95983CFF2ULL, 0x74EB8317416FE8FDULL}}},
+    // [165] = 165G
+    {{{0xF566D48E33DA6593ULL, 0x69BA8C34EEC07BBCULL, 0x109F6D08D03CC96AULL, 0x0C14F8F2CCB27D6FULL}}, {{0xC0E8649113DC3A38ULL, 0x75B740DD098075E6ULL, 0xFD4473E16FE1C284ULL, 0xC359D6923BB398F7ULL}}},
+    // [166] = 166G
+    {{{0x56835FE50C9D3205ULL, 0x09F00C12CDC12C51ULL, 0xB41F30C4EFD7C491ULL, 0xA5822BD06C673E21ULL}}, {{0xB35F4EDA136D08A8ULL, 0x19B58FA4588CB4F5ULL, 0x487708EBEB652D9FULL, 0xA3BCD62645CEBA65ULL}}},
+    // [167] = 167G
+    {{{0xE441F72E0B90E6EFULL, 0x4C9739ED75F8F21CULL, 0xBAC24789FA17115AULL, 0xA6CBC3046BC6A450ULL}}, {{0x9862AFD617FA9B9FULL, 0x60CEB573C7060313ULL, 0xB130619E2C0F95A3ULL, 0x021AE7F4680E889BULL}}},
+    // [168] = 168G
+    {{{0xBAA1F1CDCBF2D359ULL, 0x695331569D729745ULL, 0xA663505914704A7BULL, 0x328BA6C70C404497ULL}}, {{0x4A6EFE1A786FCE55ULL, 0x287D8F897B2B1B47ULL, 0xA518BDC4C4E812E4ULL, 0xC8ECC2845917B7FFULL}}},
+    // [169] = 169G
+    {{{0x344B39F99D43CC38ULL, 0x130A3C0267D11CE6ULL, 0xEBFB86C1359B1CAFULL, 0x347D6D9A02C48927ULL}}, {{0x2689FF1E31C74448ULL, 0x6D565AB687870CB1ULL, 0x1C987F6ECEC92F08ULL, 0x60EA7F61A353524DULL}}},
+    // [170] = 170G
+    {{{0x4FA07B1B19160F3BULL, 0xCD0B27F7EEC5752FULL, 0x09EA89E83889FA4BULL, 0xF9502D540CA7D5ABULL}}, {{0x6B71DF5B05C81AE8ULL, 0xB6822F65E0A7A93BULL, 0xC4BA2FBD12803A7BULL, 0xA10CE6DB4859D825ULL}}},
+    // [171] = 171G
+    {{{0x855EF7437B72656AULL, 0xD47C67B1BF31C8CFULL, 0x83F7DCB375EF5866ULL, 0xDA6545D2181DB8D9ULL}}, {{0x7FEA824B77DC208AULL, 0x6673051B4935BD89ULL, 0x9E78F07CE5680C5DULL, 0x49B96715AB6878A7ULL}}},
+    // [172] = 172G
+    {{{0x8464AB4070AB2B7AULL, 0xD9C41961F668FDB6ULL, 0xF06E95D0665A4073ULL, 0xC4F942EA2B52A8CEULL}}, {{0x3592FC86703DAD66ULL, 0xECBDE264616C3F61ULL, 0x99A77F7FEABE8213ULL, 0xC6BD3CDF50B11F93ULL}}},
+    // [173] = 173G
+    {{{0xB9D5994B8FEB1111ULL, 0xEC25D6945D657146ULL, 0xA13B8148309C6DE7ULL, 0xC40747CC9D012CB1ULL}}, {{0xBB5E83037E0FA2D4ULL, 0x5DB936156B9514E1ULL, 0xC6DE6CAF2CB48956ULL, 0x5CA560753BE2A12FULL}}},
+    // [174] = 174G
+    {{{0xFA4F1BC1DA40F082ULL, 0x838230A85B762E92ULL, 0x48FC20EC98691ED6ULL, 0x69317694D15B16C5ULL}}, {{0x4DEF01604ED38E14ULL, 0xD61A7EC68024807AULL, 0x3F5624422BBC0ABCULL, 0xE39A66553AC9F9D6ULL}}},
+    // [175] = 175G
+    {{{0xC8203EF4037F3502ULL, 0x338C7F713348BD34ULL, 0xCCF3A610BE870E78ULL, 0x4E42C8EC82C99798ULL}}, {{0x0A94473693606437ULL, 0xA5492144CC54BCC4ULL, 0xA7A8B33A07783341ULL, 0x7571D74EE5E0FB92ULL}}},
+    // [176] = 176G
+    {{{0xF3287432BEB31DB2ULL, 0x8FCAE82788F506A0ULL, 0x896A193ED088A2B6ULL, 0x78A891AA2234A498ULL}}, {{0x3069D623B9FA4343ULL, 0x54379BCDD800B82DULL, 0xFCF5F25527302DF6ULL, 0x6912A35BEB5035CBULL}}},
+    // [177] = 177G
+    {{{0x87522A1B3B0DEDEAULL, 0xD251CADB0C867432ULL, 0x23ABA2E1AF70B236ULL, 0x3775AB7089BC6AF8ULL}}, {{0x42AD961409018CF7ULL, 0xAC8DB17BF7A76A2CULL, 0xBCB9736A828CFA7FULL, 0xBE52D107BCFA09D8ULL}}},
+    // [178] = 178G
+    {{{0x7632C5C33E4CB721ULL, 0xDCB079365966C543ULL, 0xAD4572C55B488607ULL, 0x192E787021B1E83EULL}}, {{0xBFD1E93BF71E23B9ULL, 0x81C36D5C8710BB68ULL, 0xD84C22CDD600EF63ULL, 0x6C8E5D14A501C926ULL}}},
+    // [179] = 179G
+    {{{0x46959E3E82F74E26ULL, 0xD954595D1314BA88ULL, 0x9D94FB814D3D775AULL, 0xCEE31CBF7E34EC37ULL}}, {{0x0F448A01C43B1C6DULL, 0x0149EF0BE14ED4D8ULL, 0x26B947AE2BCF6BFAULL, 0x8FD64A14C06B589CULL}}},
+    // [180] = 180G
+    {{{0x74818EE88F5E524FULL, 0x0C8C0AC8D1F6B993ULL, 0xCF58F7BC65A2514DULL, 0x8267F5F35E78F30DULL}}, {{0x21AB2902DA0FF381ULL, 0xC67205E31E72C170ULL, 0x8ECC5E35E976F77EULL, 0xB5CDCB48EE2CDCD6ULL}}},
+    // [181] = 181G
+    {{{0xCDC1A01D08B47986ULL, 0xFDDB58FD45B1EBEFULL, 0x19F6EA6A4EB5464EULL, 0xB4F9EAEA09B69176ULL}}, {{0xB24A8AC07200682AULL, 0x8BB131C012CA542EULL, 0x7433A4F18C61726FULL, 0x39E5C9925B5A54B0ULL}}},
+    // [182] = 182G
+    {{{0x9169E4EA2B19A602ULL, 0x5DACF1A224B15755ULL, 0x94ED72DA5B996139ULL, 0xA076CACF92CC467CULL}}, {{0x449D42EE37E65FA4ULL, 0x10770AD296A01AD0ULL, 0x043E203FE3B8C422ULL, 0xA213CBD11F2C882DULL}}},
+    // [183] = 183G
+    {{{0xB77907792EBCC60EULL, 0x84E2515AFC3DCCC1ULL, 0xA0179A48966D30CEULL, 0xD4263DFC3D2DF923ULL}}, {{0xAE164E122A208D54ULL, 0x89E127760AD6CF7FULL, 0x30E30D6295853CE1ULL, 0x62DFAF07A0F78FEBULL}}},
+    // [184] = 184G
+    {{{0x395681815F5BE39CULL, 0xB9E912769EF3393FULL, 0x162AAAE1836A64AAULL, 0x4265BBAF8D442AC5ULL}}, {{0xB3FA2102457CF151ULL, 0x9D4552D208E1E7E2ULL, 0x87A3B97E37FD2230ULL, 0x3140B915410C1212ULL}}},
+    // [185] = 185G
+    {{{0x2233EEDA897612C4ULL, 0x0032ACC0A4A2DE42ULL, 0x4F8D35EB6930857CULL, 0x48457524820FA65AULL}}, {{0xE7A76AAA49BD0F77ULL, 0xDC6CC07DB2D60A9AULL, 0x8733C38A1FA1C2E7ULL, 0x25A748AB367979D9ULL}}},
+    // [186] = 186G
+    {{{0xB054D3844F1724C1ULL, 0x495F3686C9351822ULL, 0x2187EE0A7A4E2503ULL, 0x3E805FA563758C7BULL}}, {{0x0B4EEBA071B0594BULL, 0xCC12918983BF74F0ULL, 0xEC1DAF204A51288AULL, 0xE74D9C8F8463EA37ULL}}},
+    // [187] = 187G
+    {{{0x367A1767C11CCEDAULL, 0x045E19919152923FULL, 0xB11644F3A2AFDFC2ULL, 0xDFEEEF1881101F2CULL}}, {{0x16A83AE09A9A7517ULL, 0xC390BDE74B4BBDFFULL, 0xF9420BAB396793C0ULL, 0xECFB7056CF1DE042ULL}}},
+    // [188] = 188G
+    {{{0x75F3D8EF294845F3ULL, 0x75A7ADB1B1596240ULL, 0xEC401A7FA0F5DB8BULL, 0x296EEF5BDD483AF1ULL}}, {{0xCF85D393D3F2F8BFULL, 0x2B1DE5B2D1D3BD8CULL, 0xF9A51421B1549BCEULL, 0x94DE12D051E62940ULL}}},
+    // [189] = 189G
+    {{{0x6C82DF83B8FAE859ULL, 0x5D89BCBC6062CED3ULL, 0x3C573F44E1F38983ULL, 0x6D7EF6B17543F837ULL}}, {{0xF74B190DCA712D10ULL, 0xC521A0959B2D80BBULL, 0xDFEFA10C57FEA9BCULL, 0xCD450EC335438986ULL}}},
+    // [190] = 190G
+    {{{0xE63065B098BBAE2EULL, 0x5D8DB3A2DC56B8B1ULL, 0x2416F0AE4ED51EC8ULL, 0x32C001F5785688F6ULL}}, {{0xFCFCC8FC7C306316ULL, 0xFAC71452A632431FULL, 0x657CC56CF6E46AD1ULL, 0xE662B869A22227B3ULL}}},
+    // [191] = 191G
+    {{{0x5AF25AF66E04541FULL, 0xF3C88B9322554703ULL, 0x684500D3B991F2E3ULL, 0xE75605D59102A5A2ULL}}, {{0x8360990E2BFAD125ULL, 0x4F729AC5308B0693ULL, 0x40B9B48728473E31ULL, 0xF5C54754A8F71EE5ULL}}},
+    // [192] = 192G
+    {{{0xC7B750F733CE1752ULL, 0xE783C797D7CD204EULL, 0x812DDF64D99C9AEAULL, 0xD7A0DA58D01DC635ULL}}, {{0xBBC027380762CEF4ULL, 0x0BE040A8C062B742ULL, 0xF6F2928340E28465ULL, 0x912770E068008032ULL}}},
+    // [193] = 193G
+    {{{0x7DD43FEFB1ED620CULL, 0x9A0C2E60ABE38845ULL, 0x6A2BE453D5020BC9ULL, 0xEB98660F4C4DFAA0ULL}}, {{0xE85F44100099223EULL, 0xA0A7CD8A9411131CULL, 0x0609AF3ADD26CD20ULL, 0x6CB9A8876D9CB852ULL}}},
+    // [194] = 194G
+    {{{0xD0F9CF8031BDC863ULL, 0x1D8742AF3A39049AULL, 0x3B4AB50F6B1030CEULL, 0x838ED2EB98F46685ULL}}, {{0xAEE700EA6C6AE32FULL, 0xFC9ADB6C57D54C9CULL, 0x495BA885D9B8B819ULL, 0x836ED454D94C9199ULL}}},
+    // [195] = 195G
+    {{{0xDC3563E3B8DBA942ULL, 0x2154596941888336ULL, 0x5939F2E6892B1992ULL, 0x13E87B027D8514D3ULL}}, {{0x2570D55646B8ADF1ULL, 0xAC2B9DA568D6ABEBULL, 0xC5D624114BF1E91AULL, 0xFEF5A3C68059A6DEULL}}},
+    // [196] = 196G
+    {{{0x5F2D7CA5D86E196EULL, 0x64F08EA3AA575D8FULL, 0x88B4262217960359ULL, 0x21C76DBF7A8D075AULL}}, {{0xBC8F0186CCF45C5AULL, 0xA25F0CBD2A296656ULL, 0xDCAE9BD97378BD4AULL, 0xD67286B1D5716401ULL}}},
+    // [197] = 197G
+    {{{0x7BF4491691E5764AULL, 0x25424B371CE2708EULL, 0x17C38F06A5BE6FC1ULL, 0xEE163026E9FD6FE0ULL}}, {{0xE5430DA0AD6C62B2ULL, 0xF49AE3FA15B96623ULL, 0x43D94CCC670D0F58ULL, 0x1ACB250F255DD61CULL}}},
+    // [198] = 198G
+    {{{0x6A0C81BD90877ED5ULL, 0xFE3F31125F3BC5BCULL, 0xE38B59BA5857B83CULL, 0x93E651F2D3AC2659ULL}}, {{0x8CF83C556D73AF84ULL, 0xBF27585F4B1AC1EDULL, 0xDC34A72350EA5D40ULL, 0x907308B0980C45CEULL}}},
+    // [199] = 199G
+    {{{0x9932E5DB33AF3D80ULL, 0x1E626D4350586799ULL, 0x78DE3A750C2DC89BULL, 0xB268F5EF9AD51E4DULL}}, {{0x003E945A1216E423ULL, 0x8CF0D34FD4191614ULL, 0xB19F77D41C1DEE01ULL, 0x5F310D4B3C99B9EBULL}}},
+    // [200] = 200G
+    {{{0xEEEFBCC2E74B75FBULL, 0x8FECED69F26A8B55ULL, 0x83FE7A9DE8AE5B4BULL, 0xCD5A3BE41717D656ULL}}, {{0x9C0B605BA95832A5ULL, 0xFA92C34B1F38C89FULL, 0xB1373FBBA578001EULL, 0xFD6381EAF29657FDULL}}},
+    // [201] = 201G
+    {{{0xBF7FFDBA93C4750DULL, 0x2B02F01CA99CEEA3ULL, 0xE9FAD85EB6C7BFE4ULL, 0xFF07F3118A9DF035ULL}}, {{0x4740D098CED1F0D8ULL, 0xC1D2942114E2EDDDULL, 0xA5C440C38ECCBADDULL, 0x438136D603E858A3ULL}}},
+    // [202] = 202G
+    {{{0xC1E4DBFD90AC0427ULL, 0x658AA6490EF4EF1AULL, 0x4108C1D9049DF6B3ULL, 0x6C0D1F1784E47FF0ULL}}, {{0x1F5262F7887B72AFULL, 0x4519A730A32E2265ULL, 0x413BD16E1749EE18ULL, 0xEF9A8BD1525F4864ULL}}},
+    // [203] = 203G
+    {{{0xC16E8C3CE2B526A1ULL, 0xA4B9F69E0D825EBEULL, 0x4146FD20FFB658BEULL, 0x8D8B9855C7C052A3ULL}}, {{0x30E2E7F463036758ULL, 0x4BCF50FEE51D7CEBULL, 0x26BAF44FB84EA4D4ULL, 0xCDB559EEDC2D79F9ULL}}},
+    // [204] = 204G
+    {{{0xACC0A89758554B6CULL, 0xCA6DD9DA7A9EFA19ULL, 0xEF8B8CDBD452F7C5ULL, 0xDA9B9E9AB699C11CULL}}, {{0x25C560257BE95BDBULL, 0x01FAAF5675484185ULL, 0x75BB7A8E714E885EULL, 0xEC8598C45D39F0E0ULL}}},
+    // [205] = 205G
+    {{{0xA54263180DA32B63ULL, 0xE4B851CECA91B1EBULL, 0xBFA9D472D7AE26DFULL, 0x52DB0B5384DFBF05ULL}}, {{0xE924B69D84A7B375ULL, 0xB3180C902875679DULL, 0x23EBAF66A6DB9F57ULL, 0x0C3B997D050EE5D4ULL}}},
+    // [206] = 206G
+    {{{0x56FC4C098AD30369ULL, 0xD2F58220C30A7CB0ULL, 0xF080EA4C21A2ADE2ULL, 0x52520DE6009C7E49ULL}}, {{0x350D54CFE47BF50BULL, 0x4F3003EFE1B2802CULL, 0xF4C888520BD33955ULL, 0x9D0A6B077D71CC3BULL}}},
+    // [207] = 207G
+    {{{0xFFF543BECBD43352ULL, 0x7D0F29C3F3FA48C6ULL, 0x395EFD24E80919CCULL, 0xE62F9490D3D51DA6ULL}}, {{0x70E07BFD9CCAFA7DULL, 0xF342C8591F1DAF51ULL, 0x22C2CA280C682862ULL, 0x6D89AD7BA4876B0BULL}}},
+    // [208] = 208G
+    {{{0x65348F778DB0E595ULL, 0xA7163CB9FBA082BBULL, 0xD7CE3765816076EBULL, 0x7D86781855DB1B17ULL}}, {{0x99951E3ABC733DE8ULL, 0x2937844E0E25D532ULL, 0x2E562E2BED4F8838ULL, 0xE2B99ADFEC86F877ULL}}},
+    // [209] = 209G
+    {{{0x6D8E7D65AAAB1193ULL, 0x1AFA2FF5CB7B14FDULL, 0x957509C88F77D019ULL, 0x7F30EA2476B399B4ULL}}, {{0x80EF4BFF637ACAECULL, 0xDAFF7BB67B103E98ULL, 0x3B15389A5F6311E9ULL, 0xCA5EF7D4B231C94CULL}}},
+    // [210] = 210G
+    {{{0xB25031DF15661815ULL, 0x4E7759552D729E07ULL, 0x81C5C2CD51AC727BULL, 0x59AE134C1A41CFEEULL}}, {{0x09CDA7F01E8BFC2BULL, 0x847A414A8455218DULL, 0xBD7DF32296A9FC38ULL, 0xE0C2821689A92635ULL}}},
+    // [211] = 211G
+    {{{0xC60A0361800B7A00ULL, 0xEF0FB7B4A1DD1D9AULL, 0x46A210FADA6C903FULL, 0x5098FF1E1D9F14FBULL}}, {{0x62A5B132FD17DDC0ULL, 0xB3EE1B40D60DFE53ULL, 0x084D37C6E7542006ULL, 0x09731141D81FC8F8ULL}}},
+    // [212] = 212G
+    {{{0x2CF6531FD68BEFD5ULL, 0x8615402EB31F2C08ULL, 0x5131B1389EFFBBD2ULL, 0xF4A0CAAD9AD20992ULL}}, {{0x2DBD7A76B1B9C8B9ULL, 0x7FD5A3AE8BA8B4B1ULL, 0x64FE48656B101B58ULL, 0x3CBF5C99286222F4ULL}}},
+    // [213] = 213G
+    {{{0xB9F2C81E2778AD58ULL, 0xE2F3C4CCCE445C96ULL, 0x72895BE6B9CBEFA6ULL, 0x32B78C7DE9EE512AULL}}, {{0xA497237794C8753CULL, 0x73BB80547AE2275BULL, 0x2EFC3896EE28260CULL, 0xEE1849F513DF71E3ULL}}},
+    // [214] = 214G
+    {{{0xA8F9E0CFB9746ECCULL, 0xAC67947361320882ULL, 0x0B360AD75EE73FABULL, 0xB40226A37A1A586DULL}}, {{0x48E525620A13060CULL, 0x5226C0D3CF24C4AFULL, 0x1F8D4A3E21ACE469ULL, 0xF7CE91842E49E9D4ULL}}},
+    // [215] = 215G
+    {{{0x74B581550547A4F7ULL, 0xE37D50F08269DFC0ULL, 0xD076EEF2A7C72B0CULL, 0xE2CB74FDDC8E9FBCULL}}, {{0x8641ABCB005CC4A4ULL, 0xADDEA9E36122D2BEULL, 0x7A62DF062736EB0BULL, 0xD3AA2ED71C9DD224ULL}}},
+    // [216] = 216G
+    {{{0x577E0FFA43B4F3BCULL, 0x66C2F828CA99FACCULL, 0x52AC321EA930AFA6ULL, 0x54BEBC996F6C2B7CULL}}, {{0x2A3619AD0DE244E9ULL, 0x041EAE9F117B3E34ULL, 0x2BEBEDE498E028D8ULL, 0x15276D9145B9BCAFULL}}},
+    // [217] = 217G
+    {{{0x1BE0D99CD10AE3A8ULL, 0x26009A35F235CB14ULL, 0xDADC299496AB3574ULL, 0x8438447566D4D7BEULL}}, {{0x2390426B2EDD791FULL, 0x34EF0D7906631C4FULL, 0xA5D01AC5E6AD3307ULL, 0xC4E1020916980A4DULL}}},
+    // [218] = 218G
+    {{{0x34D667B8FAD96201ULL, 0xCAC732BE31E1B614ULL, 0x2BBA4EFF99C743DCULL, 0xCEA8D97AE24CAEBBULL}}, {{0xC90774F6BAA7E834ULL, 0xB25E0A780FDEA14EULL, 0x1DA077543CE0B7F1ULL, 0x03E6B5491EB5219DULL}}},
+    // [219] = 219G
+    {{{0x8AB65C82C711D67EULL, 0x0587D9C46F660B87ULL, 0x9B584C6FC6C30887ULL, 0x4162D488B8940203ULL}}, {{0xBDA47AE5A0852649ULL, 0xC1732F2B84B4E95DULL, 0x776F22C25FB8A3AFULL, 0x67163E903236289FULL}}},
+    // [220] = 220G
+    {{{0xFC9CAA19FF32151EULL, 0xF84B6F6249AE3D7DULL, 0xD12EF9CA0A34B068ULL, 0x4B24649AC96F264FULL}}, {{0x62F3B896E8369787ULL, 0x81C434D346DF5E0CULL, 0x2AB27141690AB859ULL, 0xC98998BE4C613A7AULL}}},
+    // [221] = 221G
+    {{{0x4F3BA4A4BF5F683DULL, 0x175D767AEC3E5068ULL, 0xF0F89BFD2DCF54FCULL, 0x3FAD3FA84CAF0F34ULL}}, {{0x3FA20EFCDFE61826ULL, 0x0CF71872E7D0D2A5ULL, 0xB2F0CA647C718A73ULL, 0x0CD1BC7CB6CC407BULL}}},
+    // [222] = 222G
+    {{{0xF600BBDE5B2C74A4ULL, 0xA562847BEC1B88B6ULL, 0x243061575DC28B48ULL, 0xBDC6C1B0F061C563ULL}}, {{0x716409CC8BAB85AEULL, 0x64D28821559FCEDCULL, 0xB40A81E852827B8EULL, 0xCA7A42DAF8694C62ULL}}},
+    // [223] = 223G
+    {{{0x1C69532FAEB1A86BULL, 0xC1FB84BF1370798FULL, 0x568C1A7CE05D0816ULL, 0x674F2600A3007A00ULL}}, {{0xE09EECC69E0D38A5ULL, 0x70DB57DA0B182259ULL, 0xEDF43B257004580BULL, 0x299D21F9413F33B3ULL}}},
+    // [224] = 224G
+    {{{0x609C45706CE6B514ULL, 0x890905C79B357322ULL, 0x8885C35600844D49ULL, 0x08BC89C2F919ED15ULL}}, {{0x6F63F4CEA8C95157ULL, 0x172D3056112776F0ULL, 0xDE776FEC3B5892C1ULL, 0xD313F3CDD7CDCC16ULL}}},
+    // [225] = 225G
+    {{{0xF87D29BD5EE9F08FULL, 0x3D82D6C692714BCFULL, 0xB81B815AD1FB3B26ULL, 0xD32F4DA54ADE74ABULL}}, {{0x2FC416910B3EEA87ULL, 0x82E14F4535359D58ULL, 0x68E99016C0597077ULL, 0xF9429E738B8E53B9ULL}}},
+    // [226] = 226G
+    {{{0x0F08670F188CE2BCULL, 0x234D56537053D014ULL, 0x78AC98661E39723DULL, 0x714651A9CB4AF14CULL}}, {{0x2DD668C1FD617CC6ULL, 0xF1F902C744E425BDULL, 0xAA11B1AB6F7EC0F3ULL, 0x28B6D7837004120FULL}}},
+    // [227] = 227G
+    {{{0x1ED954F1E3CE3FF6ULL, 0x6FBB6931F72B08CBULL, 0x6E593657135845D3ULL, 0x30E4E67043538555ULL}}, {{0xC695A559EB88DB7BULL, 0x0A878D35DA70740DULL, 0x8499350113BBC9B1ULL, 0x462F9BCE61989863ULL}}},
+    // [228] = 228G
+    {{{0x25149EED98FE1249ULL, 0x7558B9E8D46130C1ULL, 0x61FA0449250CD2A5ULL, 0x7E62469C0893FC16ULL}}, {{0xDF02760AEA9E0A2CULL, 0xF80BEB233DBD9DF7ULL, 0x0DFCAEF6A82B9C7CULL, 0x60F803C2B44D43A0ULL}}},
+    // [229] = 229G
+    {{{0xF1971B04D4CAD297ULL, 0x7F3DCD10B01E580BULL, 0x04682904330E4DEEULL, 0xBE2062003C51CC30ULL}}, {{0xD5558ED72DCCB9BCULL, 0xB1C61090905682A0ULL, 0x8573D48A74E1C655ULL, 0x62188BC49D61E542ULL}}},
+    // [230] = 230G
+    {{{0x6B51046BF16E839BULL, 0xAFDDFED53EA14522ULL, 0x867960F4F378473FULL, 0x0639863C5CF03696ULL}}, {{0x1FCA864423D1C1BEULL, 0xD00E3228BF1EB99DULL, 0xC2A5BC741DEEB71AULL, 0xC130794479F2BB77ULL}}},
+    // [231] = 231G
+    {{{0xC419859FFF5DF04AULL, 0xCB6E84A601DF5993ULL, 0xD29E0FB9AC2AF211ULL, 0x93144423ACE3451EULL}}, {{0xD902A6D13037B47CULL, 0xF1065224F72BB9D1ULL, 0x5C71A3F9D7992038ULL, 0x7C10DFB164C3425FULL}}},
+    // [232] = 232G
+    {{{0x422049A122517961ULL, 0x2FB1F35EA3ADC41FULL, 0xA5B943ABDD4A0D7FULL, 0x7D54261D569C7330ULL}}, {{0x63ADD999D2F95BB3ULL, 0xEFDD509A19C63E56ULL, 0x77559BDC7F1017D1ULL, 0xB52974A37A1C5E94ULL}}},
+    // [233] = 233G
+    {{{0xCB66418C157B112CULL, 0x97829205C7B7D2A7ULL, 0xF21CA26D6C34FB81ULL, 0xB015F8044F5FCBDCULL}}, {{0xD3AEA1454E3A1D5FULL, 0x3B3CDC6FAA3088C1ULL, 0x744A655B2DF8D5F8ULL, 0xAB8C1E086D04E813ULL}}},
+    // [234] = 234G
+    {{{0xA5CBFC789EF0184BULL, 0x30C21799E65A6647ULL, 0x52DB740B48ABA6D2ULL, 0xB35511D67E63FA65ULL}}, {{0x7DC74CEC622A5995ULL, 0x91930CD46322A119ULL, 0x8D859B3982343DEAULL, 0xC8EED15DFA36BCA2ULL}}},
+    // [235] = 235G
+    {{{0x6B3F2AF341A21B52ULL, 0x4F8A18DE57A140D3ULL, 0x9E4868117A465A3AULL, 0xD5E9E1DA649D97D8ULL}}, {{0x8955E8592F27447AULL, 0x1693465C2240480DULL, 0x111A13CC1D4DD0DBULL, 0x4CB04437F391ED73ULL}}},
+    // [236] = 236G
+    {{{0x9683BAAB330BFF95ULL, 0x7F0107D535274C94ULL, 0x0E0CA7B596DA918DULL, 0xE485BE3DACCABFABULL}}, {{0xDF71E1ABDCFD8FB6ULL, 0x7C0834F9544168FCULL, 0x30C621E8AAB586A1ULL, 0xC4071FD9F1B90283ULL}}},
+    // [237] = 237G
+    {{{0x996A5316D36966BBULL, 0x983005CD72E16D6FULL, 0x5DBF8ED77B992439ULL, 0xD3AE41047DD7CA06ULL}}, {{0x4B10DC14D125AC46ULL, 0x64F8CDD7DF0ACA61ULL, 0x2A10F0303417C6D9ULL, 0xBD1AEB21AD22EBB2ULL}}},
+    // [238] = 238G
+    {{{0x215B395A558AA151ULL, 0xB9E20C1151EFA971ULL, 0x23F53C4CF55A0A63ULL, 0x0659214AC1A17900ULL}}, {{0xD7F4590701E5364DULL, 0x4EEA355D9DABD94EULL, 0x59320A356230569AULL, 0xB126363AA4243D27ULL}}},
+    // [239] = 239G
+    {{{0x9F80AF87C897B065ULL, 0x87197D0A82E377B4ULL, 0xFC66CDD22800F0A4ULL, 0x463E2763D885F958ULL}}, {{0xB79992671EF7CA7FULL, 0x26B80C61FBC97508ULL, 0xDF3A311A94DE062BULL, 0xBFEFACDB0E5D0FD7ULL}}},
+    // [240] = 240G
+    {{{0x008FEF8516060DFCULL, 0x76545F84205E6A2AULL, 0x48494B9DC41AB086ULL, 0xDDC5310F00582AC8ULL}}, {{0xFB5F8AB6E7820CA8ULL, 0x41DBAFC6ABD04730ULL, 0x0191AB6DCC8F0E90ULL, 0xBA0D2F3AF20D9692ULL}}},
+    // [241] = 241G
+    {{{0x83CDDFC910641917ULL, 0x58E597C40BFE747CULL, 0xC6F53EC1BB63EC31ULL, 0x7985FDFD127C0567ULL}}, {{0x03A5BD567F32ED03ULL, 0x24ED291E0EC67087ULL, 0xF2B25FE1DE289AEDULL, 0x603C12DAF3D9862EULL}}},
+    // [242] = 242G
+    {{{0xF3ED516ED7C504EFULL, 0x4D8E2DF756EF139DULL, 0xA8F86C708C25F0E1ULL, 0x6A843BA43C244F89ULL}}, {{0x3112844DCAB0AF01ULL, 0xF8CBA1B16A19B8F2ULL, 0x58643C3FEB2CFAC6ULL, 0x63DAD3922E66CDFBULL}}},
+    // [243] = 243G
+    {{{0xD5FF1543DA7703E9ULL, 0x9E74C59CB83D2D0EULL, 0xB2DD249410EAC7F9ULL, 0x74A1AD6B5F76E39DULL}}, {{0xD5737FD790E0DB08ULL, 0x093E0968942E8C33ULL, 0xD6193D83631BBEA0ULL, 0xCC6157EF18C9C63CULL}}},
+    // [244] = 244G
+    {{{0x5FC0DA4813704A08ULL, 0x636478CBBFF1713AULL, 0x5EDF6A1F8A10DFF8ULL, 0x2E34552AA716AEF7ULL}}, {{0x4E44DE8E79598A01ULL, 0x64782B5A3885AB58ULL, 0x8C9CBAFEE51F97A0ULL, 0xFC822D5EA0C68B76ULL}}},
+    // [245] = 245G
+    {{{0xA71D0896B22F6DA3ULL, 0xC9BAB42C72747463ULL, 0x02D416664BA19B7FULL, 0x30682A50703375F6ULL}}, {{0x17714D9977A22FF8ULL, 0x6290D0E0F19CA73FULL, 0x6C8F39E7F311D317ULL, 0x553E04F6B018B4FAULL}}},
+    // [246] = 246G
+    {{{0xD33464C342DC0080ULL, 0x0EEF5D66580C8E23ULL, 0xA74EBD6746E13AFEULL, 0x00136933174BC388ULL}}, {{0x906E54680127FF92ULL, 0x60AC69C82044E8E5ULL, 0x689F232541C04105ULL, 0x27015DC47DBFE781ULL}}},
+    // [247] = 247G
+    {{{0x1EE6C1347769EF57ULL, 0x654E7A2B2464F52BULL, 0x6C3791EFEFA79597ULL, 0x9E2158F0D7C0D5F2ULL}}, {{0x9E2FBF2629008373ULL, 0x9FFD7C8EF35A3850ULL, 0x9003A3481FA7762EULL, 0x0712FCDD1B9053F0ULL}}},
+    // [248] = 248G
+    {{{0xF50618FA7EAF5AA3ULL, 0x8B2B0C32F081E206ULL, 0xEB76CC1731C1BA31ULL, 0x22213B78F3DCFBDFULL}}, {{0x0D86E5C8718A3051ULL, 0xE476ADD5CF739174ULL, 0xD2A203D8EEDC863FULL, 0xDD81B694EC3A60BAULL}}},
+    // [249] = 249G
+    {{{0x322857F3BE327D66ULL, 0x8172E566E3C4FCE7ULL, 0xEBA4029C202538C2ULL, 0x176E26989A43C9CFULL}}, {{0x7B47834C1FA4B1C3ULL, 0x9AEFD31F4EEE09EEULL, 0x7D270B4878DC43C1ULL, 0xED8CC9D04B29EB87ULL}}},
+    // [250] = 250G
+    {{{0x2D6C77BCAC938F93ULL, 0xC46E2A586D37641CULL, 0xA7AFC8456A40D57BULL, 0x8758A9FD232F0FE9ULL}}, {{0x7863AC2A068F7866ULL, 0xE22E369309AC3C4EULL, 0x0C0AB2C94A8E89E6ULL, 0x5CC678A31A3B536CULL}}},
+    // [251] = 251G
+    {{{0x7004788C50374DA8ULL, 0xCF1892393DFC4F1BULL, 0x68ABB89A13AD747EULL, 0x75D46EFEA3771E6EULL}}, {{0x3CA4726586A6BED8ULL, 0xD7EFC22151346E1AULL, 0xFD0B86FD2B39A868ULL, 0x9852390A99507679ULL}}},
+    // [252] = 252G
+    {{{0xD903E0547BB26BFBULL, 0x861A483939A113E2ULL, 0xA5F3C28DB17E60DAULL, 0x69B47C7249439D23ULL}}, {{0x0B08824DF1978EA2ULL, 0x43590D98E54E5678ULL, 0xFD37E43C0D6230C6ULL, 0x1A9CF6CD7C7AD92AULL}}},
+    // [253] = 253G
+    {{{0x5B7319F645605721ULL, 0x2310FB0451C86934ULL, 0xFB698C4C825F6D5FULL, 0x809A20C67D64900FULL}}, {{0x5EBFA5F3F8E286C1ULL, 0x3D096CCC54963E6AULL, 0xB76B061927FA0414ULL, 0x9E994980D9917E22ULL}}},
+    // [254] = 254G
+    {{{0x475A62C4BC8ADE53ULL, 0xED04459E09CA4351ULL, 0xC300E97D5188FCA2ULL, 0x5654834268843E72ULL}}, {{0x69394D2089481E75ULL, 0xC6DDCC39676E2EA1ULL, 0x19CF1C838C69253CULL, 0x1B33A3362BC07380ULL}}},
+    // [255] = 255G
+    {{{0x8D563446F972C180ULL, 0xDEFECE1CF29C6352ULL, 0xED4500B4EAC7083FULL, 0x1B38903A43F7F114ULL}}, {{0xD3394119DAF408F9ULL, 0x2708B26B6F5DA72AULL, 0x89353F77FD53DE4AULL, 0x4036EDC931A60AE8ULL}}},
+};
+
+// ---- normalization to the canonical range [0, p) ----
+// (adapted from UltrafastSecp256k1 field_normalize; loops unrolled so the
+// scratch arrays stay in registers)
+__device__ inline void field_normalize(const FieldElement* fe, u64 cur[4]) {
+    cur[0] = fe->limbs[0];
+    cur[1] = fe->limbs[1];
+    cur[2] = fe->limbs[2];
+    cur[3] = fe->limbs[3];
+    #pragma unroll
+    for (int pass = 0; pass < 3; ++pass) {
+        u64 tmp[4];
+        u64 borrow = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            u64 b = MODULUS[i] + borrow;
+            u64 underflow = (borrow && b == 0) ? 1ULL : 0ULL;
+            tmp[i] = cur[i] - b;
+            borrow = (cur[i] < b || underflow) ? 1ULL : 0ULL;
+        }
+        u64 mask = (borrow == 0) ? ~0ULL : 0ULL;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            cur[i] = (tmp[i] & mask) | (cur[i] & ~mask);
+        }
+    }
+}
+
+// w=8 fixed-window generator multiply, adapted from UltrafastSecp256k1
+// scalar_mul_generator_w8: the 32 windows are the big-endian secret bytes,
+// most significant first, read straight from global memory. For the random
+// keys this backend processes, the first byte is nonzero with overwhelming
+// probability, so the `started` branches are warp-uniform in practice.
+__device__ inline void scalar_mul_generator_w8_be(const u8* secret_be, JacobianPoint* r) {
+    r->infinity = true;
+    field_set_zero(&r->x);
+    field_set_one(&r->y);
+    field_set_zero(&r->z);
+
+    bool started = false;
+
+    #pragma unroll 1
+    for (int i = 0; i < 32; ++i) {
+        u32 idx = secret_be[i];
+
+        if (started) {
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+            jacobian_double_unchecked(r, r);
+        }
+
+        if (idx != 0) {
+            if (!started) {
+                r->x = GENERATOR_TABLE_W8[idx].x;
+                r->y = GENERATOR_TABLE_W8[idx].y;
+                field_set_one(&r->z);
+                r->infinity = false;
+                started = true;
+            } else {
+                jacobian_add_mixed_unchecked(r, &GENERATOR_TABLE_W8[idx], r);
+            }
+        }
+    }
+}
+
+// Derives one compressed 33-byte public key (0x02/0x03 || x) per 32-byte
+// big-endian secret key. Secrets are validated on the host (nonzero, < n),
+// so the result is always a finite point.
+extern "C" __global__ __launch_bounds__(128, 2)
+void secp256k1_pubkey33_batch(
+    const unsigned char* secret_keys,
+    unsigned char* pubkeys,
+    unsigned int count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const u8* secret = secret_keys + ((u64)idx * 32u);
+    JacobianPoint p;
+    scalar_mul_generator_w8_be(secret, &p);
+
+    u8* out = pubkeys + ((u64)idx * 33u);
+
+    // Jacobian -> affine (one field inversion per key), then serialize.
+    FieldElement zinv, zinv2, zinv3, ax, ay;
+    field_inv(&p.z, &zinv);
+    field_sqr(&zinv, &zinv2);
+    field_mul(&zinv, &zinv2, &zinv3);
+    field_mul(&p.x, &zinv2, &ax);
+    field_mul(&p.y, &zinv3, &ay);
+
+    u64 nx[4];
+    u64 ny[4];
+    field_normalize(&ax, nx);
+    field_normalize(&ay, ny);
+
+    out[0] = (ny[0] & 1ULL) ? 0x03u : 0x02u;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        u64 limb = nx[3 - i];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out[1 + i * 8 + j] = (u8)(limb >> (56 - 8 * j));
+        }
+    }
+}
+
+// ================= hash kernels (original seeker code, unchanged) =================
+__constant__ static const unsigned int SHA256_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+
+__constant__ static const unsigned int RMD_R[80] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
+    7, 4,13, 1,10, 6,15, 3,12, 0, 9, 5, 2,14,11, 8,
+    3,10,14, 4, 9,15, 8, 1, 2, 7, 0, 6,13,11, 5,12,
+    1, 9,11,10, 0, 8,12, 4,13, 3, 7,15,14, 5, 6, 2,
+    4, 0, 5, 9, 7,12, 2,10,14, 1, 3, 8,11, 6,15,13
+};
+
+__constant__ static const unsigned int RMD_RP[80] = {
+    5,14, 7, 0, 9, 2,11, 4,13, 6,15, 8, 1,10, 3,12,
+    6,11, 3, 7, 0,13, 5,10,14,15, 8,12, 4, 9, 1, 2,
+   15, 5, 1, 3, 7,14, 6, 9,11, 8,12, 2,10, 0, 4,13,
+    8, 6, 4, 1, 3,11,15, 0, 5,12, 2,13, 9, 7,10,14,
+   12,15,10, 4, 1, 5, 8, 7, 6, 2,13,14, 0, 3, 9,11
+};
+
+__constant__ static const unsigned int RMD_S[80] = {
+   11,14,15,12, 5, 8, 7, 9,11,13,14,15, 6, 7, 9, 8,
+    7, 6, 8,13,11, 9, 7,15, 7,12,15, 9,11, 7,13,12,
+   11,13, 6, 7,14, 9,13,15,14, 8,13, 6, 5,12, 7, 5,
+   11,12,14,15,14,15, 9, 8, 9,14, 5, 6, 8, 6, 5,12,
+    9,15, 5,11, 6, 8,13,12, 5,12,13,14,11, 8, 5, 6
+};
+
+__constant__ static const unsigned int RMD_SP[80] = {
+    8, 9, 9,11,13,15,15, 5, 7, 7, 8,11,14,14,12, 6,
+    9,13,15, 7,12, 8, 9,11, 7, 7,12, 7, 6,15,13,11,
+    9, 7,15,11, 8, 6, 6,14,12,13, 5,14,13,13, 7, 5,
+   15, 5, 8,11,14,14, 6,14, 6, 9,12, 9,12, 5,15, 8,
+    8, 5,12, 9,12, 5,14, 6, 8,13, 6, 5,15,13,11,11
+};
+
+__device__ __forceinline__ unsigned int rotr(unsigned int x, unsigned int n) {
+    return (x >> n) | (x << (32 - n));
+}
+
+__device__ __forceinline__ unsigned int rol(unsigned int x, unsigned int n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+__device__ __forceinline__ unsigned int byteswap32(unsigned int v) {
+    return ((v & 0x000000ffU) << 24) |
+           ((v & 0x0000ff00U) << 8)  |
+           ((v & 0x00ff0000U) >> 8)  |
+           ((v & 0xff000000U) >> 24);
+}
+
+__device__ __forceinline__ unsigned int f_rmd(unsigned int j, unsigned int x, unsigned int y, unsigned int z) {
+    if (j <= 15) return x ^ y ^ z;
+    if (j <= 31) return (x & y) | ((~x) & z);
+    if (j <= 47) return (x | (~y)) ^ z;
+    if (j <= 63) return (x & z) | (y & (~z));
+    return x ^ (y | (~z));
+}
+
+__device__ __forceinline__ unsigned int k_rmd(unsigned int j) {
+    if (j <= 15) return 0x00000000;
+    if (j <= 31) return 0x5a827999;
+    if (j <= 47) return 0x6ed9eba1;
+    if (j <= 63) return 0x8f1bbcdc;
+    return 0xa953fd4e;
+}
+
+__device__ __forceinline__ unsigned int kp_rmd(unsigned int j) {
+    if (j <= 15) return 0x50a28be6;
+    if (j <= 31) return 0x5c4dd124;
+    if (j <= 47) return 0x6d703ef3;
+    if (j <= 63) return 0x7a6d76e9;
+    return 0x00000000;
+}
+
+extern "C" __global__ void hash160_pubkey33_batch(
+    const unsigned char* pubkeys,
+    unsigned char* hash160s,
+    unsigned int count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const unsigned char* in = pubkeys + ((unsigned int)33 * idx);
+
+    unsigned int w[64];
+    for (unsigned int i = 0; i < 8; ++i) {
+        unsigned int j = i * 4;
+        w[i] = ((unsigned int)in[j] << 24) |
+               ((unsigned int)in[j + 1] << 16) |
+               ((unsigned int)in[j + 2] << 8) |
+               ((unsigned int)in[j + 3]);
+    }
+    w[8] = ((unsigned int)in[32] << 24) | 0x00800000U;
+    w[9] = 0;
+    w[10] = 0;
+    w[11] = 0;
+    w[12] = 0;
+    w[13] = 0;
+    w[14] = 0;
+    w[15] = 0x00000108U;
+
+    for (unsigned int i = 16; i < 64; ++i) {
+        unsigned int s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        unsigned int s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    unsigned int a = 0x6a09e667;
+    unsigned int b = 0xbb67ae85;
+    unsigned int c = 0x3c6ef372;
+    unsigned int d = 0xa54ff53a;
+    unsigned int e = 0x510e527f;
+    unsigned int f = 0x9b05688c;
+    unsigned int g = 0x1f83d9ab;
+    unsigned int h = 0x5be0cd19;
+
+    for (unsigned int i = 0; i < 64; ++i) {
+        unsigned int s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        unsigned int ch = (e & f) ^ ((~e) & g);
+        unsigned int temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+        unsigned int s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+        unsigned int temp2 = s0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    unsigned int sha_words[8] = {
+        0x6a09e667 + a,
+        0xbb67ae85 + b,
+        0x3c6ef372 + c,
+        0xa54ff53a + d,
+        0x510e527f + e,
+        0x9b05688c + f,
+        0x1f83d9ab + g,
+        0x5be0cd19 + h
+    };
+
+    unsigned int x[16];
+    for (unsigned int i = 0; i < 8; ++i) {
+        x[i] = byteswap32(sha_words[i]);
+    }
+    x[8] = 0x00000080U;
+    x[9] = 0;
+    x[10] = 0;
+    x[11] = 0;
+    x[12] = 0;
+    x[13] = 0;
+    x[14] = 0x00000100U;
+    x[15] = 0;
+
+    unsigned int al = 0x67452301;
+    unsigned int bl = 0xefcdab89;
+    unsigned int cl = 0x98badcfe;
+    unsigned int dl = 0x10325476;
+    unsigned int el = 0xc3d2e1f0;
+
+    unsigned int ar = al;
+    unsigned int br = bl;
+    unsigned int cr = cl;
+    unsigned int dr = dl;
+    unsigned int er = el;
+
+    for (unsigned int j = 0; j < 80; ++j) {
+        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R[j]] + k_rmd(j), RMD_S[j]) + el;
+        al = el;
+        el = dl;
+        dl = rol(cl, 10);
+        cl = bl;
+        bl = tl;
+
+        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP[j]] + kp_rmd(j), RMD_SP[j]) + er;
+        ar = er;
+        er = dr;
+        dr = rol(cr, 10);
+        cr = br;
+        br = tr;
+    }
+
+    unsigned int t = 0xefcdab89 + cl + dr;
+    unsigned int h1 = 0x98badcfe + dl + er;
+    unsigned int h2 = 0x10325476 + el + ar;
+    unsigned int h3 = 0xc3d2e1f0 + al + br;
+    unsigned int h4 = 0x67452301 + bl + cr;
+    unsigned int h0 = t;
+
+    unsigned int out_words[5] = { h0, h1, h2, h3, h4 };
+    unsigned char* out = hash160s + ((unsigned int)20 * idx);
+
+    for (unsigned int i = 0; i < 5; ++i) {
+        unsigned int v = out_words[i];
+        unsigned int j = i * 4;
+        out[j] = (unsigned char)(v);
+        out[j + 1] = (unsigned char)(v >> 8);
+        out[j + 2] = (unsigned char)(v >> 16);
+        out[j + 3] = (unsigned char)(v >> 24);
+    }
+}
+
+extern "C" __global__ void sha256_pubkey33_batch(
+    const unsigned char* pubkeys,
+    unsigned char* digests,
+    unsigned int count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    unsigned char m[64] = {0};
+    const unsigned char* in = pubkeys + ((unsigned int)33 * idx);
+    for (unsigned int i = 0; i < 33; ++i) {
+        m[i] = in[i];
+    }
+    m[33] = 0x80;
+    m[62] = 0x01;
+    m[63] = 0x08;
+
+    unsigned int w[64];
+    for (unsigned int i = 0; i < 16; ++i) {
+        unsigned int j = i * 4;
+        w[i] = ((unsigned int)m[j] << 24) |
+               ((unsigned int)m[j + 1] << 16) |
+               ((unsigned int)m[j + 2] << 8) |
+               ((unsigned int)m[j + 3]);
+    }
+
+    for (unsigned int i = 16; i < 64; ++i) {
+        unsigned int s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        unsigned int s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+
+    unsigned int a = 0x6a09e667;
+    unsigned int b = 0xbb67ae85;
+    unsigned int c = 0x3c6ef372;
+    unsigned int d = 0xa54ff53a;
+    unsigned int e = 0x510e527f;
+    unsigned int f = 0x9b05688c;
+    unsigned int g = 0x1f83d9ab;
+    unsigned int h = 0x5be0cd19;
+
+    for (unsigned int i = 0; i < 64; ++i) {
+        unsigned int s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        unsigned int ch = (e & f) ^ ((~e) & g);
+        unsigned int temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+        unsigned int s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
+        unsigned int temp2 = s0 + maj;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + temp1;
+        d = c;
+        c = b;
+        b = a;
+        a = temp1 + temp2;
+    }
+
+    unsigned int out_words[8] = {
+        0x6a09e667 + a,
+        0xbb67ae85 + b,
+        0x3c6ef372 + c,
+        0xa54ff53a + d,
+        0x510e527f + e,
+        0x9b05688c + f,
+        0x1f83d9ab + g,
+        0x5be0cd19 + h
+    };
+
+    unsigned char* out = digests + ((unsigned int)32 * idx);
+    for (unsigned int i = 0; i < 8; ++i) {
+        unsigned int v = out_words[i];
+        unsigned int j = i * 4;
+        out[j] = (unsigned char)(v >> 24);
+        out[j + 1] = (unsigned char)(v >> 16);
+        out[j + 2] = (unsigned char)(v >> 8);
+        out[j + 3] = (unsigned char)(v);
+    }
+}
+
+extern "C" __global__ void ripemd160_sha256_batch(
+    const unsigned char* sha256s,
+    unsigned char* hash160s,
+    unsigned int count
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) {
+        return;
+    }
+
+    const unsigned char* in = sha256s + ((unsigned int)32 * idx);
+
+    unsigned char m[64] = {0};
+    for (unsigned int i = 0; i < 32; ++i) {
+        m[i] = in[i];
+    }
+    m[32] = 0x80;
+    m[56] = 0x00;
+    m[57] = 0x01;
+    m[58] = 0x00;
+    m[59] = 0x00;
+    m[60] = 0x00;
+    m[61] = 0x00;
+    m[62] = 0x00;
+    m[63] = 0x00;
+
+    unsigned int x[16];
+    for (unsigned int i = 0; i < 16; ++i) {
+        unsigned int j = i * 4;
+        x[i] = ((unsigned int)m[j]) |
+               ((unsigned int)m[j + 1] << 8) |
+               ((unsigned int)m[j + 2] << 16) |
+               ((unsigned int)m[j + 3] << 24);
+    }
+
+    unsigned int al = 0x67452301;
+    unsigned int bl = 0xefcdab89;
+    unsigned int cl = 0x98badcfe;
+    unsigned int dl = 0x10325476;
+    unsigned int el = 0xc3d2e1f0;
+
+    unsigned int ar = al;
+    unsigned int br = bl;
+    unsigned int cr = cl;
+    unsigned int dr = dl;
+    unsigned int er = el;
+
+    for (unsigned int j = 0; j < 80; ++j) {
+        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R[j]] + k_rmd(j), RMD_S[j]) + el;
+        al = el;
+        el = dl;
+        dl = rol(cl, 10);
+        cl = bl;
+        bl = tl;
+
+        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP[j]] + kp_rmd(j), RMD_SP[j]) + er;
+        ar = er;
+        er = dr;
+        dr = rol(cr, 10);
+        cr = br;
+        br = tr;
+    }
+
+    unsigned int t = 0xefcdab89 + cl + dr;
+    unsigned int h1 = 0x98badcfe + dl + er;
+    unsigned int h2 = 0x10325476 + el + ar;
+    unsigned int h3 = 0xc3d2e1f0 + al + br;
+    unsigned int h4 = 0x67452301 + bl + cr;
+    unsigned int h0 = t;
+
+    unsigned int out_words[5] = { h0, h1, h2, h3, h4 };
+    unsigned char* out = hash160s + ((unsigned int)20 * idx);
+
+    for (unsigned int i = 0; i < 5; ++i) {
+        unsigned int v = out_words[i];
+        unsigned int j = i * 4;
+        out[j] = (unsigned char)(v);
+        out[j + 1] = (unsigned char)(v >> 8);
+        out[j + 2] = (unsigned char)(v >> 16);
+        out[j + 3] = (unsigned char)(v >> 24);
+    }
+}
