@@ -4,7 +4,7 @@ A high-performance Rust application that searches for collisions in Bitcoin addr
 
 It supports modular compute backends:
 - **CPU Backend**: Multithreaded key derivation and hashing using `rayon` and thread-local `secp256k1` contexts.
-- **CUDA Backend**: Feature-gated GPU acceleration using CUDA C kernels compiled at runtime via NVRTC — secp256k1 public key derivation, SHA-256 and RIPEMD-160 all run on the GPU, with CPU verification sampling.
+- **CUDA Backend**: Feature-gated GPU acceleration using CUDA C kernels compiled at runtime via NVRTC — secp256k1 public keys are derived by *incremental key walking* (each GPU thread derives one random start key, then walks `k, k+1, k+2, …` by repeated point addition of G, normalizing accumulated points with one shared modular inversion per chunk), and SHA-256 / RIPEMD-160 also run on the GPU, with CPU verification sampling.
 
 ---
 
@@ -26,9 +26,9 @@ It supports modular compute backends:
    - Fast $O(\log N)$ binary search lookup over the memory-mapped file (`memmap2`).
 
 3. **Collision Seeking Loop (`seeker`)**:
-   - Generates random 32-byte secret keys in batches using `getrandom`.
-   - Passes secret keys to the configured `HashBackend` (`cpu` or `cuda`).
-   - Checks generated 20-byte HASH160 public key digests against `AddressIndex`.
+   - Generates `batch / walk_steps` random 32-byte *start* keys per batch using `getrandom`; walk `i` covers the consecutive secrets `start_i, start_i + 1, …, start_i + walk_steps − 1` (mod the curve order), so keys stay uniformly random as a batch while the GPU pays one full scalar multiplication per walk instead of per key.
+   - Passes the walk starts to the configured `HashBackend` (`cpu` or `cuda`); the returned digests are in step-major order and a matched secret is reconstructed on the host as `(start_i + j) mod n`.
+   - Checks generated 20-byte HASH160 public key digests against `AddressIndex` in parallel (`rayon`).
    - Reports throughput statistics (~1M attempts interval) and outputs private key if a collision occurs.
 
 ---
@@ -66,7 +66,8 @@ cargo run --release --features cuda
 
 | Variable | Default | Description |
 |---|---|---|
-| `SEEKER_BATCH_SIZE` | `32768` | Number of secret keys per batch |
+| `SEEKER_BATCH_SIZE` | `32768` (CPU) / `2097152` (CUDA) | Keys per batch, rounded down to a whole number of walks |
+| `SEEKER_WALK_STEPS` | `128` | Consecutive keys per walk; each batch is split into `batch / walk_steps` walks |
 | `SEEKER_BACKEND` | `cpu` | Backend choice (`cpu` or `cuda`) |
 | `SEEKER_CUDA_VERIFY_SAMPLE` | `64` | Number of CPU verification samples per CUDA batch (`0` checks all entries) |
 | `SEEKER_CUDA_VERIFY_SECP` | `1` | Set to `0` to disable CPU secp256k1 pubkey parity verification for CUDA |
@@ -75,22 +76,45 @@ cargo run --release --features cuda
 
 ---
 
-## Docker Support
+## Benchmarks
 
-Build and run using Docker or Docker Compose:
+Measured 2026-10-04, release build (`cargo build --release --features cuda`), ~30 s runs, index of 536,740 addresses.
 
-```bash
-# Build Docker image
-docker build -t seeker .
+**Hardware**: NVIDIA GeForce RTX 3060 Ti (8 GB GDDR6, 38 SMs, sm_86), AMD Ryzen 5 5600X (6C/12T), Windows 11, CUDA 13.3 (runtime NVRTC compilation), driver 616.56.
 
-# Run container (requires addresses.bin mounted into working directory)
-docker run --rm -v $(pwd)/addresses.bin:/addresses.bin seeker
+**Parameters**: end-to-end throughput counts keys fully processed per second (random start generation → public key derivation → SHA-256 + RIPEMD-160 → index check), with CUDA verification sampling at its default of 64 keys per batch unless noted otherwise.
 
-# Or using docker-compose
-docker compose up
-```
+| Configuration | Parameters | Throughput |
+|---|---|---|
+| CUDA, incremental walk (default) | `SEEKER_BATCH_SIZE=2097152`, `SEEKER_WALK_STEPS=128`, sampling on | **~32.1M keys/s** |
+| CUDA, one scalar multiply per key | `SEEKER_WALK_STEPS=1`, verification disabled (fused hash kernel) | ~1.8M keys/s |
+| CPU backend | `SEEKER_BATCH_SIZE=32768` | ~320K keys/s |
+
+The end-to-end speedup over the pre-walk pipeline is ~119×. The pipeline is no longer EC-bound: per 1M keys the GPU spends ~6 ms in the walk kernel, ~11.3 ms in SHA-256 (its `w[64]` message schedule still spills to local memory), and ~3.6 ms in RIPEMD-160.
+
+### EC stage only (nsys kernel medians)
+
+| Derivation strategy | Time per 1M keys | Public keys/s |
+|---|---|---|
+| Incremental walk (default parameters) | ~6.0 ms | ~168M |
+| Per-key w=8 scalar multiply + inversion (`SEEKER_WALK_STEPS=1`) | ~378 ms | ~2.6M |
+
+That is a **~63× speedup of the EC stage**: one full scalar multiply (248 doublings, 31 mixed additions, one Fermat inversion) per *walk* instead of per key, ~7 field multiplications + a shared chunk inversion per key, plus SHA-256/RIPEMD-160 unchanged.
+
+### Walk parameter sweep (EC kernel only, per 1M keys)
+
+| Batch size | Steps/walk | Walker threads | Kernel time |
+|---|---|---|---|
+| 2^20 | 16 | 65,536 | 22.7 ms |
+| 2^20 | 32 | 32,768 | 13.4 ms |
+| 2^20 | 64 | 16,384 | 8.2 ms |
+| 2^20 | 128 | 8,192 | 23.3 ms |
+| 2^21 (default) | 128 | 16,384 | **6.0 ms** |
+
+The walker count trades kernel occupancy against scalar-multiply amortization: fewer walkers underutilize the SMs, more walkers spend proportionally more time in per-walk scalar multiplies. ~16K walkers is the measured sweet spot on this GPU.
 
 ---
+
 
 ## Testing & Verification
 

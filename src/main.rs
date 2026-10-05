@@ -196,12 +196,34 @@ fn main() -> Result<()> {
     let backend = backend::create_default_backend()?;
     println!("Backend selected: {}", backend.name());
 
+    // Walking backends amortize one scalar multiplication over `walk_steps`
+    // consecutive keys, so the GPU path needs much larger batches than the
+    // CPU path to keep the device busy. 2^21 keys at 128 steps per walk
+    // measures as the fastest EC-kernel configuration on a 38-SM GPU
+    // (16384 walker threads); smaller batches starve it, larger ones only
+    // grow the host-side digest scan.
+    let default_batch = if backend.name() == "cuda" { 1 << 21 } else { 32768 };
     let batch_size = std::env::var("SEEKER_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(32768);
-    println!("Batch size: {batch_size}");
+        .unwrap_or(default_batch);
+
+    let walk_steps = std::env::var("SEEKER_WALK_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(128)
+        .min(u32::MAX as usize)
+        .min(batch_size);
+    // Batch actually scanned per iteration: the batch size rounded down to a
+    // whole number of walks.
+    let walk_threads = batch_size / walk_steps;
+    let batch_size = walk_threads * walk_steps;
+    println!(
+        "Batch size: {batch_size} ({} walks x {walk_steps} steps)",
+        walk_threads
+    );
 
     let startup_vectors = [[1u8; 32], [2u8; 32]];
     let startup_hashes = backend.hash_batch_from_secret_bytes(&startup_vectors)?;
@@ -214,12 +236,13 @@ fn main() -> Result<()> {
 
     println!("Index loaded with {} entries", index.len);
 
-    let mut secret_batch = Vec::with_capacity(batch_size);
-    let mut buffer = vec![0u8; batch_size * 32];
+    let mut walk_starts = Vec::with_capacity(walk_threads);
+    let mut buffer = vec![0u8; walk_threads * 32];
+    let mut next_report = 1_000_000u64;
 
     loop {
-        generate_secret_key_bytes_batch(batch_size, &mut secret_batch, &mut buffer);
-        let hashes = match backend.hash_batch_from_secret_bytes(&secret_batch) {
+        generate_secret_key_bytes_batch(walk_threads, &mut walk_starts, &mut buffer);
+        let hashes = match backend.hash_batch_walking(&walk_starts, walk_steps) {
             Ok(h) => h,
             Err(err) => {
                 eprintln!("Backend hashing failed for current batch: {err}");
@@ -227,23 +250,33 @@ fn main() -> Result<()> {
             }
         };
 
-        let attempts = ATTEMPTS.fetch_add(secret_batch.len() as u64, Ordering::Relaxed)
-            + secret_batch.len() as u64;
+        let attempts = ATTEMPTS.fetch_add(batch_size as u64, Ordering::Relaxed) + batch_size as u64;
 
-        if attempts % 1_000_000 < batch_size as u64 {
+        if attempts >= next_report {
             let elapsed = start.elapsed().as_secs_f64();
             let rate = (attempts as f64 / elapsed) as u64;
             println!("Attempts: {attempts}, throughput: {rate} keys/s");
+            next_report = attempts + 1_000_000;
         }
 
-        for (secret_bytes, hash) in secret_batch.iter().zip(hashes.iter()) {
-            if index.contains(hash) {
-                let secret_key = SecretKey::from_byte_array(*secret_bytes)
-                    .expect("validated secret key batch should contain valid keys");
-                println!("Collision detected!");
-                println!("Private key: {}", secret_key.display_secret());
-                return Ok(());
-            }
+        // The index check is host-side and linear in the digest count, which
+        // makes it a real fraction of wall time once the backend produces
+        // millions of digests per second — spread it across cores. Digest
+        // order is step-major: idx = step * walk_threads + start_index
+        // (see HashBackend::hash_batch_walking).
+        if let Some((idx, _)) = hashes
+            .par_iter()
+            .enumerate()
+            .find_first(|(_, hash)| index.contains(hash))
+        {
+            let start_index = idx % walk_threads;
+            let step = (idx / walk_threads) as u32;
+            let secret_bytes = backend::add_small_mod_n(&walk_starts[start_index], step);
+            let secret_key = SecretKey::from_byte_array(secret_bytes)
+                .expect("reconstructed walk secret key must be a valid scalar");
+            println!("Collision detected!");
+            println!("Private key: {}", secret_key.display_secret());
+            return Ok(());
         }
     }
 
@@ -355,6 +388,25 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn walking_hashes_match_reference() {
+        let backend = backend::create_default_backend().unwrap();
+        let starts = vec![[1u8; 32], [2u8; 32], [0x11u8; 32]];
+        let steps = 5;
+
+        let out = backend.hash_batch_walking(&starts, steps).unwrap();
+        assert_eq!(out.len(), starts.len() * steps);
+
+        // Step-major digest order; walk i, step j must hash (starts[i] + j).
+        for j in 0..steps {
+            for i in 0..starts.len() {
+                let secret = backend::add_small_mod_n(&starts[i], j as u32);
+                let expected = legacy_hash_from_secret_bytes(secret);
+                assert_eq!(out[j * starts.len() + i], expected, "step {j}, walk {i}");
+            }
+        }
     }
 
     #[test]

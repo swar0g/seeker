@@ -20,6 +20,14 @@
 //    produces (k + 2^256 - n - 1)*G instead of k*G; the plain w8 windows
 //    here are the textbook MSB-first fixed-window scheme).
 //
+// The incremental key-walk kernel (secp256k1_walk33_batch) and the
+// serialize_pubkey33 helper are original seeker code built on the vendored
+// field and Jacobian point ops: instead of one full scalar multiplication
+// per key, each thread derives its start key once and then walks
+// k, k+1, k+2, ... by repeated mixed addition of G, normalizing WALK_CHUNK
+// accumulated Jacobian points per chunk with a single shared field
+// inversion (Montgomery's batch inversion).
+//
 // The SHA-256 / RIPEMD-160 / fused HASH160 kernels at the bottom are the
 // original seeker implementations, unchanged.
 //
@@ -1168,6 +1176,25 @@ __device__ inline void scalar_mul_generator_w8_be(const u8* secret_be, JacobianP
     }
 }
 
+// Serializes one affine point as a 33-byte compressed public key
+// (0x02/0x03 || x, big-endian).
+__device__ inline void serialize_pubkey33(const FieldElement* x, const FieldElement* y, u8* out) {
+    u64 nx[4];
+    u64 ny[4];
+    field_normalize(x, nx);
+    field_normalize(y, ny);
+
+    out[0] = (ny[0] & 1ULL) ? 0x03u : 0x02u;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        u64 limb = nx[3 - i];
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out[1 + i * 8 + j] = (u8)(limb >> (56 - 8 * j));
+        }
+    }
+}
+
 // Derives one compressed 33-byte public key (0x02/0x03 || x) per 32-byte
 // big-endian secret key. Secrets are validated on the host (nonzero, < n),
 // so the result is always a finite point.
@@ -1195,20 +1222,102 @@ void secp256k1_pubkey33_batch(
     field_mul(&zinv, &zinv2, &zinv3);
     field_mul(&p.x, &zinv2, &ax);
     field_mul(&p.y, &zinv3, &ay);
+    serialize_pubkey33(&ax, &ay, out);
+}
 
-    u64 nx[4];
-    u64 ny[4];
-    field_normalize(&ax, nx);
-    field_normalize(&ay, ny);
+// Chunk of consecutive walk points collected in Jacobian form before their Z
+// coordinates are inverted together with one shared Fermat inversion
+// (Montgomery's batch inversion): 1 inversion + ~2 multiplications per point
+// instead of a full inversion per point.
+#define WALK_CHUNK 32
 
-    out[0] = (ny[0] & 1ULL) ? 0x03u : 0x02u;
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        u64 limb = nx[3 - i];
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            out[1 + i * 8 + j] = (u8)(limb >> (56 - 8 * j));
+// Incremental key-walk kernel: thread `idx` starts from the secret at
+// start_keys + 32*idx and covers the consecutive secrets start, start+1, ...,
+// start+steps-1 by repeated Jacobian mixed addition of G. The per-key cost is
+// one mixed addition (7M+4S) plus the shared chunk inversion, instead of the
+// full w=8 scalar multiplication (248 doublings, 31 additions, one inversion)
+// the per-key kernel spends. Output is step-major:
+// pubkeys + 33 * (step * threads + idx), i.e. the digest at index
+// step * threads + idx belongs to secret (start + step) mod n.
+//
+// Walk points are finite by construction: starts are validated on the host
+// (nonzero, < n) and a walk only reaches the identity if it passes through
+// the scalar 0 mod n, which needs start > n - steps - probability ~2^-224
+// for validated starts. The mixed addition itself still handles the p == G
+// doubling case and the p == -G case, so no input-dependent branches are
+// taken in practice.
+extern "C" __global__ __launch_bounds__(128, 2)
+void secp256k1_walk33_batch(
+    const unsigned char* start_keys,
+    unsigned char* pubkeys,
+    unsigned int threads,
+    unsigned int steps
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= threads) {
+        return;
+    }
+
+    JacobianPoint p;
+    scalar_mul_generator_w8_be(start_keys + ((u64)idx * 32u), &p);
+
+    const AffinePoint* g = &GENERATOR_TABLE_W8[1];
+
+    FieldElement xs[WALK_CHUNK];
+    FieldElement ys[WALK_CHUNK];
+    FieldElement zs[WALK_CHUNK];
+    FieldElement prefix[WALK_CHUNK];
+
+    unsigned int base = 0;
+    while (base < steps) {
+        unsigned int chunk = steps - base;
+        if (chunk > WALK_CHUNK) {
+            chunk = WALK_CHUNK;
         }
+
+        // Collect the chunk's points, walking forward by adding G. The
+        // addition after the last stored point feeds the next chunk (and is
+        // simply discarded after the final chunk).
+        #pragma unroll 1
+        for (unsigned int i = 0; i < chunk; ++i) {
+            xs[i] = p.x;
+            ys[i] = p.y;
+            zs[i] = p.z;
+            jacobian_add_mixed_unchecked(&p, g, &p);
+        }
+
+        // Montgomery batch inversion of zs[0..chunk]: prefix products, one
+        // inversion of the total product, then back-substitution.
+        prefix[0] = zs[0];
+        for (unsigned int i = 1; i < chunk; ++i) {
+            field_mul(&prefix[i - 1], &zs[i], &prefix[i]);
+        }
+
+        FieldElement acc, zinv, zinv2, zinv3, ax, ay;
+        field_inv(&prefix[chunk - 1], &acc);
+        #pragma unroll 1
+        for (unsigned int i = chunk; i-- > 0;) {
+            // acc == 1/(z0*...*z_i): zinv = acc * (z0*...*z_{i-1}) == 1/z_i.
+            if (i > 0) {
+                field_mul(&acc, &prefix[i - 1], &zinv);
+            } else {
+                zinv = acc;
+            }
+            field_sqr(&zinv, &zinv2);
+            field_mul(&zinv, &zinv2, &zinv3);
+            field_mul(&xs[i], &zinv2, &ax);
+            field_mul(&ys[i], &zinv3, &ay);
+            serialize_pubkey33(
+                &ax, &ay,
+                pubkeys + ((((u64)(base + i)) * threads) + idx) * 33u
+            );
+            // acc <- acc * z_i == 1/(z0*...*z_{i-1}) for the next iteration.
+            if (i > 0) {
+                field_mul(&acc, &zs[i], &acc);
+            }
+        }
+
+        base += chunk;
     }
 }
 

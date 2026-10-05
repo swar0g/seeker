@@ -35,11 +35,18 @@ The hashing pipeline is abstracted behind the `HashBackend` trait (`src/backend/
 
 ```rust
 fn hash_batch_from_secret_bytes(&self, secret_keys: &[[u8; 32]]) -> Result<Vec<[u8; 20]>>
+fn hash_batch_walking(&self, starts: &[[u8; 32]], steps: usize) -> Result<Vec<[u8; 20]>>
 ```
+
+`hash_batch_walking` hashes consecutive key walks: walk `i` covers the secrets `(starts[i] + j) mod n` for `j in 0..steps`, digest order is **step-major** (`digest[j * starts.len() + i]` belongs to `(starts[i] + j) mod n`), and the main loop reconstructs a matched secret with `add_small_mod_n` (`src/backend/mod.rs`, curve-order modular addition, verified against the curve group law in tests). The default implementation expands the walks into explicit keys; the CPU backend uses it unchanged (still one scalar multiplication per key).
 
 Two implementations exist:
 - **`CpuBackend`** (`src/backend/cpu.rs`): delegates to the CPU path in `main.rs` using `rayon`-friendly thread-local `Secp256k1` contexts.
-- **`CudaBackend`** (`src/backend/cuda.rs`, feature-gated `cuda`): runs the whole pipeline on GPU — secp256k1 public key derivation (fixed-base w=8 windowed multiply over a precomputed `[0..255]*G` table in `__constant__` memory), then SHA-256 and RIPEMD-160, all compiled at runtime via NVRTC. Kernel source lives in `src/backend/cuda_kernels.cu` (embedded with `include_str!`; the derivation code is vendored from UltrafastSecp256k1, MIT). Device buffers persist across batches: each batch costs exactly one bulk host→device upload of the packed secret keys and one bulk device→host download of the HASH160 digests; public keys and intermediate SHA-256 digests are chained on the device and never touch host memory. All kernels are enqueued before any blocking copy, so the GPU stays busy for the whole batch. Includes per-batch CPU verification sampling of GPU-derived public keys, SHA-256 and HASH160 digests (only the sampled bytes are copied back). Launch config: 128 threads/block for the derivation kernel (per its `__launch_bounds__`), 256 for the hash kernels.
+- **`CudaBackend`** (`src/backend/cuda.rs`, feature-gated `cuda`): runs the whole pipeline on GPU, compiled at runtime via NVRTC. Kernel source lives in `src/backend/cuda_kernels.cu` (embedded with `include_str!`; the field/point arithmetic is vendored from UltrafastSecp256k1, MIT). Two derivation kernels exist:
+  - `secp256k1_pubkey33_batch` (per-key): one fixed-base w=8 windowed multiply over the precomputed `[0..255]*G` `__constant__` table plus one Fermat inversion per key. Used by `hash_batch_from_secret_bytes` (self-check, tests).
+  - `secp256k1_walk33_batch` (incremental, used by `hash_batch_walking`): each thread derives its start key once, then walks `k, k+1, k+2, …` by repeated Jacobian mixed addition of G (7M+4S per key). `WALK_CHUNK = 32` consecutive points are collected in Jacobian form and their Z coordinates are normalized with a single shared inversion (Montgomery batch inversion). Measures ~63× the per-key kernel's EC throughput at the default 128 steps per walk.
+
+  Device buffers persist across batches: a walking batch costs one bulk host→device upload of the packed walk starts (`batch / steps` keys, not the whole batch) and one bulk device→host download of the HASH160 digests; public keys and intermediate SHA-256 digests are chained on the device and never touch host memory. All kernels are enqueued before any blocking copy. Verification sampling per batch: contiguous front sample (pubkeys / SHA-256, cheap D2H) plus a spread sample checked against the already-downloaded HASH160 digests, so walk steps across all threads are covered end to end. Launch config: 128 threads/block for the derivation kernels (per their `__launch_bounds__`), 256 for the hash kernels.
 
 Backend selection: `create_default_backend()` picks CPU by default; set `SEEKER_BACKEND=cuda` to force CUDA.
 
@@ -55,13 +62,14 @@ The binary file `addresses.bin` is memory-mapped and has a fixed layout:
 
 ### Main loop (`src/main.rs`)
 
-Generates random 32-byte secret keys in batches, calls the active backend to produce HASH160 values, then binary-searches the index. Prints throughput every ~1 M attempts. `SEEKER_BATCH_SIZE` env var controls batch size (default 32768).
+Each iteration generates `batch / walk_steps` random 32-byte start keys, calls `hash_batch_walking(starts, walk_steps)`, then checks all digests against the index in parallel (`rayon`, first match wins). On a match the secret is reconstructed as `(starts[idx % walks] + idx / walks) mod n` and printed. Prints throughput every ~1 M attempts. Measured on an RTX 3060 Ti with default settings: ~32 M keys/s (CUDA) vs ~320 K keys/s (CPU); the remaining CUDA bottleneck is the SHA-256 kernel (its `w[64]` message schedule spills to local memory) and per-batch host↔device sync, not the EC stage.
 
 ### Environment variables
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SEEKER_BATCH_SIZE` | `32768` | Keys per batch |
+| `SEEKER_BATCH_SIZE` | `32768` (CPU) / `2097152` (CUDA) | Keys per batch (rounded down to a multiple of the walk length) |
+| `SEEKER_WALK_STEPS` | `128` | Consecutive keys per walk; batch is split into `batch / steps` walks |
 | `SEEKER_BACKEND` | CPU | Set to `cuda` to use CUDA backend |
 | `SEEKER_CUDA_VERIFY_SAMPLE` | `64` | CPU-check this many keys per batch for CUDA parity (`0` = all) |
 | `SEEKER_CUDA_VERIFY_SECP` | enabled | Set to `0` to skip GPU pubkey vs CPU derivation verification |
