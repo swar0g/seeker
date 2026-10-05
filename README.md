@@ -117,23 +117,6 @@ Group 128 alone (walk length unchanged) measures *below* the 32-point baseline: 
 
 ---
 
-## Docker Support
-
-Build and run using Docker or Docker Compose:
-
-```bash
-# Build Docker image
-docker build -t seeker .
-
-# Run container (requires addresses.bin mounted into working directory)
-docker run --rm -v $(pwd)/addresses.bin:/addresses.bin seeker
-
-# Or using docker-compose
-docker compose up
-```
-
----
-
 ## Testing & Verification
 
 Run tests:
