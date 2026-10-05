@@ -24,12 +24,15 @@
 // serialize_pubkey33 helper are original seeker code built on the vendored
 // field and Jacobian point ops: instead of one full scalar multiplication
 // per key, each thread derives its start key once and then walks
-// k, k+1, k+2, ... by repeated mixed addition of G, normalizing WALK_CHUNK
-// accumulated Jacobian points per chunk with a single shared field
+// k, k+1, k+2, ... by repeated mixed addition of G, normalizing WALK_GROUP
+// accumulated Jacobian points per group with a single shared field
 // inversion (Montgomery's batch inversion).
 //
 // The SHA-256 / RIPEMD-160 / fused HASH160 kernels at the bottom are the
-// original seeker implementations, unchanged.
+// original seeker implementations, fully unrolled: the round constants and
+// RIPEMD index/rotation tables are switch functions instead of __constant__
+// arrays, so the unrolled loops keep w[]/x[] in registers and fold the zero
+// padding words away.
 //
 // The vendored portions of this file incorporate work provided under the
 // MIT License, Copyright (c) 2026 Vano Chkheidze
@@ -1225,18 +1228,23 @@ void secp256k1_pubkey33_batch(
     serialize_pubkey33(&ax, &ay, out);
 }
 
-// Chunk of consecutive walk points collected in Jacobian form before their Z
+// Group of consecutive walk points collected in Jacobian form before their Z
 // coordinates are inverted together with one shared Fermat inversion
-// (Montgomery's batch inversion): 1 inversion + ~2 multiplications per point
-// instead of a full inversion per point.
-#define WALK_CHUNK 32
+// (Montgomery's batch inversion): 1 inversion + ~3 multiplications per point
+// instead of a full inversion per point. The Fermat inversion chain costs
+// ~255 squarings, so amortizing it over 256 points instead of 32 removes
+// ~6 field-multiplication equivalents per walked key; the per-thread working
+// set (4 x WALK_GROUP x 32 B of local memory) grows to 32 KB accordingly and
+// streams through L2 on the back-substitution pass.
+#define WALK_GROUP 256
 
 // Incremental key-walk kernel: thread `idx` starts from the secret at
 // start_keys + 32*idx and covers the consecutive secrets start, start+1, ...,
 // start+steps-1 by repeated Jacobian mixed addition of G. The per-key cost is
-// one mixed addition (7M+4S) plus the shared chunk inversion, instead of the
-// full w=8 scalar multiplication (248 doublings, 31 additions, one inversion)
-// the per-key kernel spends. Output is step-major:
+// one mixed addition (7M+4S) plus the shared group inversion (one Fermat
+// inversion per WALK_GROUP keys), instead of the full w=8 scalar
+// multiplication (248 doublings, 31 additions, one inversion) the per-key
+// kernel spends. Output is step-major:
 // pubkeys + 33 * (step * threads + idx), i.e. the digest at index
 // step * threads + idx belongs to secret (start + step) mod n.
 //
@@ -1263,40 +1271,40 @@ void secp256k1_walk33_batch(
 
     const AffinePoint* g = &GENERATOR_TABLE_W8[1];
 
-    FieldElement xs[WALK_CHUNK];
-    FieldElement ys[WALK_CHUNK];
-    FieldElement zs[WALK_CHUNK];
-    FieldElement prefix[WALK_CHUNK];
+    FieldElement xs[WALK_GROUP];
+    FieldElement ys[WALK_GROUP];
+    FieldElement zs[WALK_GROUP];
+    FieldElement prefix[WALK_GROUP];
 
     unsigned int base = 0;
     while (base < steps) {
-        unsigned int chunk = steps - base;
-        if (chunk > WALK_CHUNK) {
-            chunk = WALK_CHUNK;
+        unsigned int group = steps - base;
+        if (group > WALK_GROUP) {
+            group = WALK_GROUP;
         }
 
-        // Collect the chunk's points, walking forward by adding G. The
-        // addition after the last stored point feeds the next chunk (and is
-        // simply discarded after the final chunk).
+        // Collect the group's points, walking forward by adding G. The
+        // addition after the last stored point feeds the next group (and is
+        // simply discarded after the final group).
         #pragma unroll 1
-        for (unsigned int i = 0; i < chunk; ++i) {
+        for (unsigned int i = 0; i < group; ++i) {
             xs[i] = p.x;
             ys[i] = p.y;
             zs[i] = p.z;
             jacobian_add_mixed_unchecked(&p, g, &p);
         }
 
-        // Montgomery batch inversion of zs[0..chunk]: prefix products, one
+        // Montgomery batch inversion of zs[0..group]: prefix products, one
         // inversion of the total product, then back-substitution.
         prefix[0] = zs[0];
-        for (unsigned int i = 1; i < chunk; ++i) {
+        for (unsigned int i = 1; i < group; ++i) {
             field_mul(&prefix[i - 1], &zs[i], &prefix[i]);
         }
 
         FieldElement acc, zinv, zinv2, zinv3, ax, ay;
-        field_inv(&prefix[chunk - 1], &acc);
+        field_inv(&prefix[group - 1], &acc);
         #pragma unroll 1
-        for (unsigned int i = chunk; i-- > 0;) {
+        for (unsigned int i = group; i-- > 0;) {
             // acc == 1/(z0*...*z_i): zinv = acc * (z0*...*z_{i-1}) == 1/z_i.
             if (i > 0) {
                 field_mul(&acc, &prefix[i - 1], &zinv);
@@ -1317,53 +1325,142 @@ void secp256k1_walk33_batch(
             }
         }
 
-        base += chunk;
+        base += group;
     }
 }
 
-// ================= hash kernels (original seeker code, unchanged) =================
-__constant__ static const unsigned int SHA256_K[64] = {
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-};
+// ============ hash kernels (original seeker code, fully unrolled) ============
+// Round constants and RIPEMD index/rotation tables as switch functions of the
+// round number: with the hash loops fully unrolled every lookup folds into a
+// compile-time constant, which keeps w[]/x[] in registers (dynamic indexing
+// through __constant__ arrays would push them into local memory) and lets the
+// zero-padding words fold away.
 
-__constant__ static const unsigned int RMD_R[80] = {
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15,
-    7, 4,13, 1,10, 6,15, 3,12, 0, 9, 5, 2,14,11, 8,
-    3,10,14, 4, 9,15, 8, 1, 2, 7, 0, 6,13,11, 5,12,
-    1, 9,11,10, 0, 8,12, 4,13, 3, 7,15,14, 5, 6, 2,
-    4, 0, 5, 9, 7,12, 2,10,14, 1, 3, 8,11, 6,15,13
-};
+__device__ __forceinline__ unsigned int SHA256_K(unsigned int i) {
+    switch (i) {
+        case 0: return 0x428a2f98; case 1: return 0x71374491; case 2: return 0xb5c0fbcf; case 3: return 0xe9b5dba5;
+        case 4: return 0x3956c25b; case 5: return 0x59f111f1; case 6: return 0x923f82a4; case 7: return 0xab1c5ed5;
+        case 8: return 0xd807aa98; case 9: return 0x12835b01; case 10: return 0x243185be; case 11: return 0x550c7dc3;
+        case 12: return 0x72be5d74; case 13: return 0x80deb1fe; case 14: return 0x9bdc06a7; case 15: return 0xc19bf174;
+        case 16: return 0xe49b69c1; case 17: return 0xefbe4786; case 18: return 0x0fc19dc6; case 19: return 0x240ca1cc;
+        case 20: return 0x2de92c6f; case 21: return 0x4a7484aa; case 22: return 0x5cb0a9dc; case 23: return 0x76f988da;
+        case 24: return 0x983e5152; case 25: return 0xa831c66d; case 26: return 0xb00327c8; case 27: return 0xbf597fc7;
+        case 28: return 0xc6e00bf3; case 29: return 0xd5a79147; case 30: return 0x06ca6351; case 31: return 0x14292967;
+        case 32: return 0x27b70a85; case 33: return 0x2e1b2138; case 34: return 0x4d2c6dfc; case 35: return 0x53380d13;
+        case 36: return 0x650a7354; case 37: return 0x766a0abb; case 38: return 0x81c2c92e; case 39: return 0x92722c85;
+        case 40: return 0xa2bfe8a1; case 41: return 0xa81a664b; case 42: return 0xc24b8b70; case 43: return 0xc76c51a3;
+        case 44: return 0xd192e819; case 45: return 0xd6990624; case 46: return 0xf40e3585; case 47: return 0x106aa070;
+        case 48: return 0x19a4c116; case 49: return 0x1e376c08; case 50: return 0x2748774c; case 51: return 0x34b0bcb5;
+        case 52: return 0x391c0cb3; case 53: return 0x4ed8aa4a; case 54: return 0x5b9cca4f; case 55: return 0x682e6ff3;
+        case 56: return 0x748f82ee; case 57: return 0x78a5636f; case 58: return 0x84c87814; case 59: return 0x8cc70208;
+        case 60: return 0x90befffa; case 61: return 0xa4506ceb; case 62: return 0xbef9a3f7; case 63: return 0xc67178f2;
+        default: return 0;
+    }
+}
 
-__constant__ static const unsigned int RMD_RP[80] = {
-    5,14, 7, 0, 9, 2,11, 4,13, 6,15, 8, 1,10, 3,12,
-    6,11, 3, 7, 0,13, 5,10,14,15, 8,12, 4, 9, 1, 2,
-   15, 5, 1, 3, 7,14, 6, 9,11, 8,12, 2,10, 0, 4,13,
-    8, 6, 4, 1, 3,11,15, 0, 5,12, 2,13, 9, 7,10,14,
-   12,15,10, 4, 1, 5, 8, 7, 6, 2,13,14, 0, 3, 9,11
-};
+__device__ __forceinline__ unsigned int RMD_R(unsigned int i) {
+    switch (i) {
+        case 0: return 0; case 1: return 1; case 2: return 2; case 3: return 3;
+        case 4: return 4; case 5: return 5; case 6: return 6; case 7: return 7;
+        case 8: return 8; case 9: return 9; case 10: return 10; case 11: return 11;
+        case 12: return 12; case 13: return 13; case 14: return 14; case 15: return 15;
+        case 16: return 7; case 17: return 4; case 18: return 13; case 19: return 1;
+        case 20: return 10; case 21: return 6; case 22: return 15; case 23: return 3;
+        case 24: return 12; case 25: return 0; case 26: return 9; case 27: return 5;
+        case 28: return 2; case 29: return 14; case 30: return 11; case 31: return 8;
+        case 32: return 3; case 33: return 10; case 34: return 14; case 35: return 4;
+        case 36: return 9; case 37: return 15; case 38: return 8; case 39: return 1;
+        case 40: return 2; case 41: return 7; case 42: return 0; case 43: return 6;
+        case 44: return 13; case 45: return 11; case 46: return 5; case 47: return 12;
+        case 48: return 1; case 49: return 9; case 50: return 11; case 51: return 10;
+        case 52: return 0; case 53: return 8; case 54: return 12; case 55: return 4;
+        case 56: return 13; case 57: return 3; case 58: return 7; case 59: return 15;
+        case 60: return 14; case 61: return 5; case 62: return 6; case 63: return 2;
+        case 64: return 4; case 65: return 0; case 66: return 5; case 67: return 9;
+        case 68: return 7; case 69: return 12; case 70: return 2; case 71: return 10;
+        case 72: return 14; case 73: return 1; case 74: return 3; case 75: return 8;
+        case 76: return 11; case 77: return 6; case 78: return 15; case 79: return 13;
+        default: return 0;
+    }
+}
 
-__constant__ static const unsigned int RMD_S[80] = {
-   11,14,15,12, 5, 8, 7, 9,11,13,14,15, 6, 7, 9, 8,
-    7, 6, 8,13,11, 9, 7,15, 7,12,15, 9,11, 7,13,12,
-   11,13, 6, 7,14, 9,13,15,14, 8,13, 6, 5,12, 7, 5,
-   11,12,14,15,14,15, 9, 8, 9,14, 5, 6, 8, 6, 5,12,
-    9,15, 5,11, 6, 8,13,12, 5,12,13,14,11, 8, 5, 6
-};
+__device__ __forceinline__ unsigned int RMD_RP(unsigned int i) {
+    switch (i) {
+        case 0: return 5; case 1: return 14; case 2: return 7; case 3: return 0;
+        case 4: return 9; case 5: return 2; case 6: return 11; case 7: return 4;
+        case 8: return 13; case 9: return 6; case 10: return 15; case 11: return 8;
+        case 12: return 1; case 13: return 10; case 14: return 3; case 15: return 12;
+        case 16: return 6; case 17: return 11; case 18: return 3; case 19: return 7;
+        case 20: return 0; case 21: return 13; case 22: return 5; case 23: return 10;
+        case 24: return 14; case 25: return 15; case 26: return 8; case 27: return 12;
+        case 28: return 4; case 29: return 9; case 30: return 1; case 31: return 2;
+        case 32: return 15; case 33: return 5; case 34: return 1; case 35: return 3;
+        case 36: return 7; case 37: return 14; case 38: return 6; case 39: return 9;
+        case 40: return 11; case 41: return 8; case 42: return 12; case 43: return 2;
+        case 44: return 10; case 45: return 0; case 46: return 4; case 47: return 13;
+        case 48: return 8; case 49: return 6; case 50: return 4; case 51: return 1;
+        case 52: return 3; case 53: return 11; case 54: return 15; case 55: return 0;
+        case 56: return 5; case 57: return 12; case 58: return 2; case 59: return 13;
+        case 60: return 9; case 61: return 7; case 62: return 10; case 63: return 14;
+        case 64: return 12; case 65: return 15; case 66: return 10; case 67: return 4;
+        case 68: return 1; case 69: return 5; case 70: return 8; case 71: return 7;
+        case 72: return 6; case 73: return 2; case 74: return 13; case 75: return 14;
+        case 76: return 0; case 77: return 3; case 78: return 9; case 79: return 11;
+        default: return 0;
+    }
+}
 
-__constant__ static const unsigned int RMD_SP[80] = {
-    8, 9, 9,11,13,15,15, 5, 7, 7, 8,11,14,14,12, 6,
-    9,13,15, 7,12, 8, 9,11, 7, 7,12, 7, 6,15,13,11,
-    9, 7,15,11, 8, 6, 6,14,12,13, 5,14,13,13, 7, 5,
-   15, 5, 8,11,14,14, 6,14, 6, 9,12, 9,12, 5,15, 8,
-    8, 5,12, 9,12, 5,14, 6, 8,13, 6, 5,15,13,11,11
-};
+__device__ __forceinline__ unsigned int RMD_S(unsigned int i) {
+    switch (i) {
+        case 0: return 11; case 1: return 14; case 2: return 15; case 3: return 12;
+        case 4: return 5; case 5: return 8; case 6: return 7; case 7: return 9;
+        case 8: return 11; case 9: return 13; case 10: return 14; case 11: return 15;
+        case 12: return 6; case 13: return 7; case 14: return 9; case 15: return 8;
+        case 16: return 7; case 17: return 6; case 18: return 8; case 19: return 13;
+        case 20: return 11; case 21: return 9; case 22: return 7; case 23: return 15;
+        case 24: return 7; case 25: return 12; case 26: return 15; case 27: return 9;
+        case 28: return 11; case 29: return 7; case 30: return 13; case 31: return 12;
+        case 32: return 11; case 33: return 13; case 34: return 6; case 35: return 7;
+        case 36: return 14; case 37: return 9; case 38: return 13; case 39: return 15;
+        case 40: return 14; case 41: return 8; case 42: return 13; case 43: return 6;
+        case 44: return 5; case 45: return 12; case 46: return 7; case 47: return 5;
+        case 48: return 11; case 49: return 12; case 50: return 14; case 51: return 15;
+        case 52: return 14; case 53: return 15; case 54: return 9; case 55: return 8;
+        case 56: return 9; case 57: return 14; case 58: return 5; case 59: return 6;
+        case 60: return 8; case 61: return 6; case 62: return 5; case 63: return 12;
+        case 64: return 9; case 65: return 15; case 66: return 5; case 67: return 11;
+        case 68: return 6; case 69: return 8; case 70: return 13; case 71: return 12;
+        case 72: return 5; case 73: return 12; case 74: return 13; case 75: return 14;
+        case 76: return 11; case 77: return 8; case 78: return 5; case 79: return 6;
+        default: return 0;
+    }
+}
+
+__device__ __forceinline__ unsigned int RMD_SP(unsigned int i) {
+    switch (i) {
+        case 0: return 8; case 1: return 9; case 2: return 9; case 3: return 11;
+        case 4: return 13; case 5: return 15; case 6: return 15; case 7: return 5;
+        case 8: return 7; case 9: return 7; case 10: return 8; case 11: return 11;
+        case 12: return 14; case 13: return 14; case 14: return 12; case 15: return 6;
+        case 16: return 9; case 17: return 13; case 18: return 15; case 19: return 7;
+        case 20: return 12; case 21: return 8; case 22: return 9; case 23: return 11;
+        case 24: return 7; case 25: return 7; case 26: return 12; case 27: return 7;
+        case 28: return 6; case 29: return 15; case 30: return 13; case 31: return 11;
+        case 32: return 9; case 33: return 7; case 34: return 15; case 35: return 11;
+        case 36: return 8; case 37: return 6; case 38: return 6; case 39: return 14;
+        case 40: return 12; case 41: return 13; case 42: return 5; case 43: return 14;
+        case 44: return 13; case 45: return 13; case 46: return 7; case 47: return 5;
+        case 48: return 15; case 49: return 5; case 50: return 8; case 51: return 11;
+        case 52: return 14; case 53: return 14; case 54: return 6; case 55: return 14;
+        case 56: return 6; case 57: return 9; case 58: return 12; case 59: return 9;
+        case 60: return 12; case 61: return 5; case 62: return 15; case 63: return 8;
+        case 64: return 8; case 65: return 5; case 66: return 12; case 67: return 9;
+        case 68: return 12; case 69: return 5; case 70: return 14; case 71: return 6;
+        case 72: return 8; case 73: return 13; case 74: return 6; case 75: return 5;
+        case 76: return 15; case 77: return 13; case 78: return 11; case 79: return 11;
+        default: return 0;
+    }
+}
 
 __device__ __forceinline__ unsigned int rotr(unsigned int x, unsigned int n) {
     return (x >> n) | (x << (32 - n));
@@ -1417,6 +1514,7 @@ extern "C" __global__ void hash160_pubkey33_batch(
     const unsigned char* in = pubkeys + ((unsigned int)33 * idx);
 
     unsigned int w[64];
+    #pragma unroll
     for (unsigned int i = 0; i < 8; ++i) {
         unsigned int j = i * 4;
         w[i] = ((unsigned int)in[j] << 24) |
@@ -1433,6 +1531,7 @@ extern "C" __global__ void hash160_pubkey33_batch(
     w[14] = 0;
     w[15] = 0x00000108U;
 
+    #pragma unroll
     for (unsigned int i = 16; i < 64; ++i) {
         unsigned int s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
         unsigned int s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
@@ -1448,10 +1547,11 @@ extern "C" __global__ void hash160_pubkey33_batch(
     unsigned int g = 0x1f83d9ab;
     unsigned int h = 0x5be0cd19;
 
+    #pragma unroll
     for (unsigned int i = 0; i < 64; ++i) {
         unsigned int s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         unsigned int ch = (e & f) ^ ((~e) & g);
-        unsigned int temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+        unsigned int temp1 = h + s1 + ch + SHA256_K(i) + w[i];
         unsigned int s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
         unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
         unsigned int temp2 = s0 + maj;
@@ -1478,6 +1578,7 @@ extern "C" __global__ void hash160_pubkey33_batch(
     };
 
     unsigned int x[16];
+    #pragma unroll
     for (unsigned int i = 0; i < 8; ++i) {
         x[i] = byteswap32(sha_words[i]);
     }
@@ -1502,15 +1603,16 @@ extern "C" __global__ void hash160_pubkey33_batch(
     unsigned int dr = dl;
     unsigned int er = el;
 
+    #pragma unroll
     for (unsigned int j = 0; j < 80; ++j) {
-        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R[j]] + k_rmd(j), RMD_S[j]) + el;
+        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R(j)] + k_rmd(j), RMD_S(j)) + el;
         al = el;
         el = dl;
         dl = rol(cl, 10);
         cl = bl;
         bl = tl;
 
-        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP[j]] + kp_rmd(j), RMD_SP[j]) + er;
+        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP(j)] + kp_rmd(j), RMD_SP(j)) + er;
         ar = er;
         er = dr;
         dr = rol(cr, 10);
@@ -1528,6 +1630,7 @@ extern "C" __global__ void hash160_pubkey33_batch(
     unsigned int out_words[5] = { h0, h1, h2, h3, h4 };
     unsigned char* out = hash160s + ((unsigned int)20 * idx);
 
+    #pragma unroll
     for (unsigned int i = 0; i < 5; ++i) {
         unsigned int v = out_words[i];
         unsigned int j = i * 4;
@@ -1550,6 +1653,7 @@ extern "C" __global__ void sha256_pubkey33_batch(
 
     unsigned char m[64] = {0};
     const unsigned char* in = pubkeys + ((unsigned int)33 * idx);
+    #pragma unroll
     for (unsigned int i = 0; i < 33; ++i) {
         m[i] = in[i];
     }
@@ -1558,6 +1662,7 @@ extern "C" __global__ void sha256_pubkey33_batch(
     m[63] = 0x08;
 
     unsigned int w[64];
+    #pragma unroll
     for (unsigned int i = 0; i < 16; ++i) {
         unsigned int j = i * 4;
         w[i] = ((unsigned int)m[j] << 24) |
@@ -1566,6 +1671,7 @@ extern "C" __global__ void sha256_pubkey33_batch(
                ((unsigned int)m[j + 3]);
     }
 
+    #pragma unroll
     for (unsigned int i = 16; i < 64; ++i) {
         unsigned int s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
         unsigned int s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
@@ -1581,10 +1687,11 @@ extern "C" __global__ void sha256_pubkey33_batch(
     unsigned int g = 0x1f83d9ab;
     unsigned int h = 0x5be0cd19;
 
+    #pragma unroll
     for (unsigned int i = 0; i < 64; ++i) {
         unsigned int s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         unsigned int ch = (e & f) ^ ((~e) & g);
-        unsigned int temp1 = h + s1 + ch + SHA256_K[i] + w[i];
+        unsigned int temp1 = h + s1 + ch + SHA256_K(i) + w[i];
         unsigned int s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
         unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
         unsigned int temp2 = s0 + maj;
@@ -1611,6 +1718,7 @@ extern "C" __global__ void sha256_pubkey33_batch(
     };
 
     unsigned char* out = digests + ((unsigned int)32 * idx);
+    #pragma unroll
     for (unsigned int i = 0; i < 8; ++i) {
         unsigned int v = out_words[i];
         unsigned int j = i * 4;
@@ -1634,6 +1742,7 @@ extern "C" __global__ void ripemd160_sha256_batch(
     const unsigned char* in = sha256s + ((unsigned int)32 * idx);
 
     unsigned char m[64] = {0};
+    #pragma unroll
     for (unsigned int i = 0; i < 32; ++i) {
         m[i] = in[i];
     }
@@ -1648,6 +1757,7 @@ extern "C" __global__ void ripemd160_sha256_batch(
     m[63] = 0x00;
 
     unsigned int x[16];
+    #pragma unroll
     for (unsigned int i = 0; i < 16; ++i) {
         unsigned int j = i * 4;
         x[i] = ((unsigned int)m[j]) |
@@ -1668,15 +1778,16 @@ extern "C" __global__ void ripemd160_sha256_batch(
     unsigned int dr = dl;
     unsigned int er = el;
 
+    #pragma unroll
     for (unsigned int j = 0; j < 80; ++j) {
-        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R[j]] + k_rmd(j), RMD_S[j]) + el;
+        unsigned int tl = rol(al + f_rmd(j, bl, cl, dl) + x[RMD_R(j)] + k_rmd(j), RMD_S(j)) + el;
         al = el;
         el = dl;
         dl = rol(cl, 10);
         cl = bl;
         bl = tl;
 
-        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP[j]] + kp_rmd(j), RMD_SP[j]) + er;
+        unsigned int tr = rol(ar + f_rmd(79 - j, br, cr, dr) + x[RMD_RP(j)] + kp_rmd(j), RMD_SP(j)) + er;
         ar = er;
         er = dr;
         dr = rol(cr, 10);
@@ -1694,6 +1805,7 @@ extern "C" __global__ void ripemd160_sha256_batch(
     unsigned int out_words[5] = { h0, h1, h2, h3, h4 };
     unsigned char* out = hash160s + ((unsigned int)20 * idx);
 
+    #pragma unroll
     for (unsigned int i = 0; i < 5; ++i) {
         unsigned int v = out_words[i];
         unsigned int j = i * 4;

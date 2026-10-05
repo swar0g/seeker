@@ -458,7 +458,7 @@ impl CudaBackend {
     /// packed 32-byte walk starts go over the bus: the walk kernel derives
     /// each start's public key with the w=8 fixed-window multiply and then
     /// walks `steps` consecutive keys per thread by repeated mixed addition
-    /// of G, batch-normalizing the accumulated Jacobian points per chunk
+    /// of G, batch-normalizing the accumulated Jacobian points per group
     /// with one shared field inversion. The SHA-256 / RIPEMD-160 stage is
     /// unchanged and runs over the full `starts.len() * steps` keys.
     ///
@@ -766,8 +766,8 @@ mod tests {
 
         let starts = varied_starts(4);
 
-        // 70 steps = two full WALK_CHUNK chunks plus a remainder chunk, and
-        // the default verification flags are on, so every batch is also
+        // 70 steps = a single partial Montgomery group (70 < WALK_GROUP),
+        // and the default verification flags are on, so every batch is also
         // checked by the in-band sampling (contiguous + spread).
         let steps = 70;
         let out = backend.hash_batch_walking(&starts, steps).unwrap();
@@ -788,6 +788,12 @@ mod tests {
         let many = varied_starts(64);
         let big = backend.hash_batch_walking(&many, 128).unwrap();
         assert_eq!(big, walk_reference(&many, 128));
+
+        // Multi-group walk: 300 steps = one full 256-point Montgomery group
+        // plus a 44-point remainder group at the default WALK_GROUP.
+        let long = varied_starts(4);
+        let long_out = backend.hash_batch_walking(&long, 300).unwrap();
+        assert_eq!(long_out, walk_reference(&long, 300));
     }
 
     #[test]

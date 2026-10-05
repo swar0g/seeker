@@ -4,7 +4,7 @@ A high-performance Rust application that searches for collisions in Bitcoin addr
 
 It supports modular compute backends:
 - **CPU Backend**: Multithreaded key derivation and hashing using `rayon` and thread-local `secp256k1` contexts.
-- **CUDA Backend**: Feature-gated GPU acceleration using CUDA C kernels compiled at runtime via NVRTC — secp256k1 public keys are derived by *incremental key walking* (each GPU thread derives one random start key, then walks `k, k+1, k+2, …` by repeated point addition of G, normalizing accumulated points with one shared modular inversion per chunk), and SHA-256 / RIPEMD-160 also run on the GPU, with CPU verification sampling.
+- **CUDA Backend**: Feature-gated GPU acceleration using CUDA C kernels compiled at runtime via NVRTC — secp256k1 public keys are derived by *incremental key walking* (each GPU thread derives one random start key, then walks `k, k+1, k+2, …` by repeated point addition of G, normalizing accumulated points with one shared modular inversion per 256-point group), and SHA-256 / RIPEMD-160 also run on the GPU, with CPU verification sampling.
 
 ---
 
@@ -66,8 +66,8 @@ cargo run --release --features cuda
 
 | Variable | Default | Description |
 |---|---|---|
-| `SEEKER_BATCH_SIZE` | `32768` (CPU) / `2097152` (CUDA) | Keys per batch, rounded down to a whole number of walks |
-| `SEEKER_WALK_STEPS` | `128` | Consecutive keys per walk; each batch is split into `batch / walk_steps` walks |
+| `SEEKER_BATCH_SIZE` | `32768` (CPU) / `4194304` (CUDA) | Keys per batch, rounded down to a whole number of walks |
+| `SEEKER_WALK_STEPS` | `256` | Consecutive keys per walk; each batch is split into `batch / walk_steps` walks |
 | `SEEKER_BACKEND` | `cpu` | Backend choice (`cpu` or `cuda`) |
 | `SEEKER_CUDA_VERIFY_SAMPLE` | `64` | Number of CPU verification samples per CUDA batch (`0` checks all entries) |
 | `SEEKER_CUDA_VERIFY_SECP` | `1` | Set to `0` to disable CPU secp256k1 pubkey parity verification for CUDA |
@@ -78,7 +78,7 @@ cargo run --release --features cuda
 
 ## Benchmarks
 
-Measured 2026-10-04, release build (`cargo build --release --features cuda`), ~30 s runs, index of 536,740 addresses.
+Measured 2026-10-05, release build (`cargo build --release --features cuda`), ~60 s runs (marginal rate between steady-state progress prints), index of 536,740 addresses.
 
 **Hardware**: NVIDIA GeForce RTX 3060 Ti (8 GB GDDR6, 38 SMs, sm_86), AMD Ryzen 5 5600X (6C/12T), Windows 11, CUDA 13.3 (runtime NVRTC compilation), driver 616.56.
 
@@ -86,35 +86,53 @@ Measured 2026-10-04, release build (`cargo build --release --features cuda`), ~3
 
 | Configuration | Parameters | Throughput |
 |---|---|---|
-| CUDA, incremental walk (default) | `SEEKER_BATCH_SIZE=2097152`, `SEEKER_WALK_STEPS=128`, sampling on | **~32.1M keys/s** |
+| CUDA, incremental walk (default) | `SEEKER_BATCH_SIZE=4194304`, `SEEKER_WALK_STEPS=256`, sampling on | **~35M keys/s** |
+| CUDA, previous defaults (2^21 batch, 128 steps, 32-point inversion group) | `SEEKER_BATCH_SIZE=2097152`, `SEEKER_WALK_STEPS=128` | ~31.1M keys/s |
 | CUDA, one scalar multiply per key | `SEEKER_WALK_STEPS=1`, verification disabled (fused hash kernel) | ~1.8M keys/s |
 | CPU backend | `SEEKER_BATCH_SIZE=32768` | ~320K keys/s |
 
-The end-to-end speedup over the pre-walk pipeline is ~119×. The pipeline is no longer EC-bound: per 1M keys the GPU spends ~6 ms in the walk kernel, ~11.3 ms in SHA-256 (its `w[64]` message schedule still spills to local memory), and ~3.6 ms in RIPEMD-160.
+The end-to-end speedup over the pre-walk pipeline is ~128×. The pipeline is host-bound now: per 1M keys the GPU spends ~4.3 ms in the walk kernel, ~1.7 ms in SHA-256 and ~0.6 ms in RIPEMD-160 (both hash kernels are fully unrolled, so their message words stay in registers), leaving the device idle for roughly three quarters of the wall time — the remaining bottleneck is the host-side digest scan and per-batch transfers, not the EC stage.
 
 ### EC stage only (nsys kernel medians)
 
 | Derivation strategy | Time per 1M keys | Public keys/s |
 |---|---|---|
-| Incremental walk (default parameters) | ~6.0 ms | ~168M |
+| Incremental walk (default parameters) | ~4.3 ms | ~232M |
 | Per-key w=8 scalar multiply + inversion (`SEEKER_WALK_STEPS=1`) | ~378 ms | ~2.6M |
 
-That is a **~63× speedup of the EC stage**: one full scalar multiply (248 doublings, 31 mixed additions, one Fermat inversion) per *walk* instead of per key, ~7 field multiplications + a shared chunk inversion per key, plus SHA-256/RIPEMD-160 unchanged.
+That is a **~88× speedup of the EC stage**: one full scalar multiply (248 doublings, 31 mixed additions, one Fermat inversion) per *walk* instead of per key, ~7 field multiplications + one shared group inversion per key (a single Fermat inversion amortized over `WALK_GROUP = 256` walked keys), plus SHA-256/RIPEMD-160 unchanged.
 
-### Walk parameter sweep (EC kernel only, per 1M keys)
+### Inversion-group sweep (end-to-end, marginal rates, ~16K walker threads)
 
-| Batch size | Steps/walk | Walker threads | Kernel time |
+The walk kernel batch-normalizes accumulated Jacobian points with Montgomery's trick: one Fermat inversion (~255 squarings) shared across `WALK_GROUP` consecutive points. Widening the group amortizes the inversion further but grows the per-thread local-memory working set (4 × `WALK_GROUP` × 32 B), so the win needs the walk length to follow the group:
+
+| `WALK_GROUP` | Batch size | Steps/walk | End-to-end |
 |---|---|---|---|
-| 2^20 | 16 | 65,536 | 22.7 ms |
-| 2^20 | 32 | 32,768 | 13.4 ms |
-| 2^20 | 64 | 16,384 | 8.2 ms |
-| 2^20 | 128 | 8,192 | 23.3 ms |
-| 2^21 (default) | 128 | 16,384 | **6.0 ms** |
+| 32 (pre-2026-10-05) | 2^21 | 128 | ~31.1M keys/s |
+| 128 | 2^21 | 128 | ~29.8M keys/s |
+| **256 (default)** | 2^22 | 256 | **~34.5M keys/s** |
+| 512 | 2^23 | 512 | ~34.4M keys/s |
 
-The walker count trades kernel occupancy against scalar-multiply amortization: fewer walkers underutilize the SMs, more walkers spend proportionally more time in per-walk scalar multiplies. ~16K walkers is the measured sweet spot on this GPU.
+Group 128 alone (walk length unchanged) measures *below* the 32-point baseline: the larger per-thread working set falls out of L1 before the back-substitution pass re-reads it. Group 256 with matching 256-step walks gains ~11% end-to-end (the EC kernel itself improves ~1.4×, from ~6.0 to ~4.3 ms per 1M keys); group 512 is within noise of 256 while doubling the batch buffers, so 256 ships. ~16K walker threads remains the sweet spot for the walk kernel's occupancy-vs-amortization trade-off.
 
 ---
 
+## Docker Support
+
+Build and run using Docker or Docker Compose:
+
+```bash
+# Build Docker image
+docker build -t seeker .
+
+# Run container (requires addresses.bin mounted into working directory)
+docker run --rm -v $(pwd)/addresses.bin:/addresses.bin seeker
+
+# Or using docker-compose
+docker compose up
+```
+
+---
 
 ## Testing & Verification
 

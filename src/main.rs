@@ -192,17 +192,29 @@ pub(crate) fn hash_batch_from_secret_bytes(secret_keys: &[[u8; 32]]) -> Result<V
         .collect()
 }
 
+/// Reconstructs the secret covered by digest index `idx` of a walking batch.
+///
+/// Digest order is step-major: `idx = step * walk_threads + start_index`
+/// (see `HashBackend::hash_batch_walking`), so the secret is
+/// `(starts[start_index] + step) mod n`.
+fn reconstruct_walk_secret(starts: &[[u8; 32]], walk_threads: usize, idx: usize) -> [u8; 32] {
+    let start_index = idx % walk_threads;
+    let step = (idx / walk_threads) as u32;
+    backend::add_small_mod_n(&starts[start_index], step)
+}
+
 fn main() -> Result<()> {
     let backend = backend::create_default_backend()?;
     println!("Backend selected: {}", backend.name());
 
     // Walking backends amortize one scalar multiplication over `walk_steps`
     // consecutive keys, so the GPU path needs much larger batches than the
-    // CPU path to keep the device busy. 2^21 keys at 128 steps per walk
-    // measures as the fastest EC-kernel configuration on a 38-SM GPU
-    // (16384 walker threads); smaller batches starve it, larger ones only
-    // grow the host-side digest scan.
-    let default_batch = if backend.name() == "cuda" { 1 << 21 } else { 32768 };
+    // CPU path to keep the device busy. 2^22 keys at 256 steps per walk
+    // measures as the fastest configuration on a 38-SM GPU (16384 walker
+    // threads, one walk = one 256-point Montgomery inversion group, the walk
+    // kernel's WALK_GROUP); smaller batches starve it, larger ones only grow
+    // the host-side digest scan.
+    let default_batch = if backend.name() == "cuda" { 1 << 22 } else { 32768 };
     let batch_size = std::env::var("SEEKER_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -213,7 +225,7 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(128)
+        .unwrap_or(256)
         .min(u32::MAX as usize)
         .min(batch_size);
     // Batch actually scanned per iteration: the batch size rounded down to a
@@ -269,9 +281,7 @@ fn main() -> Result<()> {
             .enumerate()
             .find_first(|(_, hash)| index.contains(hash))
         {
-            let start_index = idx % walk_threads;
-            let step = (idx / walk_threads) as u32;
-            let secret_bytes = backend::add_small_mod_n(&walk_starts[start_index], step);
+            let secret_bytes = reconstruct_walk_secret(&walk_starts, walk_threads, idx);
             let secret_key = SecretKey::from_byte_array(secret_bytes)
                 .expect("reconstructed walk secret key must be a valid scalar");
             println!("Collision detected!");
@@ -407,6 +417,57 @@ mod tests {
                 assert_eq!(out[j * starts.len() + i], expected, "step {j}, walk {i}");
             }
         }
+    }
+
+    #[test]
+    fn collision_reports_the_secret_matching_the_planted_digest() {
+        let backend = backend::create_default_backend().unwrap();
+
+        // Deterministic, valid walk starts (4 walks x 8 steps).
+        let starts: Vec<[u8; 32]> = (1u8..=4)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[0] = 0xa0 + i;
+                k[15] = i.wrapping_mul(37);
+                k[31] = i.wrapping_mul(7) + 1;
+                k
+            })
+            .collect();
+        let steps = 8;
+
+        let hashes = backend.hash_batch_walking(&starts, steps).unwrap();
+        assert_eq!(hashes.len(), starts.len() * steps);
+
+        // Plant the digest of walk 2, step 5 into a real BTCIDX01 index file
+        // (same layout AddressIndex::open validates).
+        let target_idx = 5 * starts.len() + 2;
+        let planted = hashes[target_idx];
+        let mut content = Vec::new();
+        content.extend_from_slice(b"BTCIDX01");
+        content.extend_from_slice(&1u64.to_le_bytes());
+        content.extend_from_slice(&[0u8; 16]);
+        content.extend_from_slice(&planted);
+        let guard = TempFileGuard::new_with_content(&content);
+        let index = AddressIndex::open(&guard.path).unwrap();
+
+        // Exactly the main loop's path: find_first over the step-major
+        // digests, reconstruct via the shared helper, format via
+        // display_secret.
+        let (idx, _) = hashes
+            .par_iter()
+            .enumerate()
+            .find_first(|(_, hash)| index.contains(hash))
+            .expect("planted digest must be found");
+        let secret_bytes = reconstruct_walk_secret(&starts, starts.len(), idx);
+        let secret_key = SecretKey::from_byte_array(secret_bytes)
+            .expect("reconstructed walk secret key must be a valid scalar");
+
+        // The shown private key must be the collision's key: it sits at
+        // (starts[2] + 5) mod n and hashes back to the planted digest.
+        assert_eq!(idx, target_idx);
+        assert_eq!(secret_bytes, backend::add_small_mod_n(&starts[2], 5));
+        assert_eq!(legacy_hash_from_secret_bytes(secret_bytes), planted);
+        assert_eq!(secret_key.display_secret().to_string().len(), 64);
     }
 
     #[test]
